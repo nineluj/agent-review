@@ -53,8 +53,11 @@
   :type 'string
   :group 'agent-review)
 
-(defvar agent-review--current-issues nil
+(defvar-local agent-review--current-issues nil
   "Current list of issues being displayed.")
+
+(defvar-local agent-review--agent-config nil
+  "Agent configuration used for the current review.")
 
 ;;; Git Integration
 
@@ -330,9 +333,11 @@ Returns list of issue plists sorted by file, then severity."
       (message "File not found: %s" file))))
 
 (defun agent-review-refresh ()
-  "Re-run the code review asynchronously."
+  "Re-run the code review asynchronously using the same agent."
   (interactive)
-  (call-interactively #'agent-review))
+  (if agent-review--agent-config
+      (agent-review agent-review--agent-config)
+    (call-interactively #'agent-review)))
 
 (defvar-keymap agent-review-mode-map
   :doc "Keymap for `agent-review-mode'."
@@ -354,12 +359,14 @@ Returns list of issue plists sorted by file, then severity."
   (setq tabulated-list-padding 2)
   (tabulated-list-init-header))
 
-(defun agent-review--display-issues (issues)
-  "Display ISSUES in a tabulated list buffer."
+(defun agent-review--display-issues (issues agent-config)
+  "Display ISSUES in a tabulated list buffer.
+AGENT-CONFIG is stored for refresh operations."
   (let ((buffer (get-buffer-create "*Agent Review*")))
     (with-current-buffer buffer
       (agent-review-mode)
       (setq agent-review--current-issues issues)
+      (setq agent-review--agent-config agent-config)
       (setq tabulated-list-entries
             (mapcar #'agent-review--format-entry issues))
       (tabulated-list-print t)
@@ -436,7 +443,7 @@ allowing Emacs to remain responsive during the review."
                (special-mode)))
          (let ((issues (agent-review--parse-issues response)))
            (if issues
-               (agent-review--display-issues issues)
+               (agent-review--display-issues issues agent-config)
              (message "No issues found in review")
              (with-current-buffer (get-buffer-create "*Agent Review*")
                (let ((inhibit-read-only t))
@@ -444,6 +451,7 @@ allowing Emacs to remain responsive during the review."
                  (insert "Agent Review Complete\n")
                  (insert "=====================\n\n")
                  (insert "No issues found in review.\n"))
+               (setq agent-review--agent-config agent-config)
                (special-mode)))))))))
 
 (provide 'agent-review)
