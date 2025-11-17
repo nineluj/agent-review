@@ -2,10 +2,7 @@
 
 AI-powered code review for git changes using ACP (Agent Client Protocol).
 
-<video src="./assets/demo.mp4" controls width="800">
-  <source src="./assets/demo.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
+https://github.com/user-attachments/assets/8ad86c2d-a91e-4f69-b51a-0f7f72ae0b19
 
 ## Overview
 
