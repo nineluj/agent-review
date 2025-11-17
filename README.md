@@ -28,6 +28,17 @@ For setting up individual agents (Claude Code, Cursor, Gemini CLI, etc.), follow
  '(agent-review :type git :host github :repo "nineluj/agent-review"))
 ```
 
+### Using Doom Emacs
+
+Add to your `packages.el`:
+
+```elisp
+(package! agent-review
+  :recipe (:host github
+           :repo "nineluj/agent-review"
+           :files ("*.el")))
+```
+
 ### Manual
 
 Clone this repository and add to your load path:
