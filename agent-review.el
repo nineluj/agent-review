@@ -125,103 +125,134 @@ Returns alist with :staged and :unstaged keys."
    "Git changes:\n\n"
    (agent-review--format-changes-for-prompt changes)))
 
-(defvar agent-review--response-text nil
-  "Buffer-local storage for agent response text.")
+(defvar-local agent-review--session-client nil
+  "Current review session's ACP client.")
 
-(defun agent-review--request-review (changes config)
-  "Send CHANGES to agent using CONFIG and get review results.
-Returns raw agent response text."
-  (message "Initializing agent session...")
-  (let* ((client (funcall (alist-get :client-maker config)
-                          (current-buffer)))
-         (session-id nil)
-         (response-text "")
-         (response-complete nil)
-         (error-occurred nil))
-    
-    ;; Subscribe to notifications to capture agent output
-    (acp-subscribe-to-notifications
-     :client client
-     :buffer (current-buffer)
-     :on-notification
-     (lambda (notification)
-       (let-alist notification
-         (when (equal .method "session/update")
-           (let ((update (alist-get 'update .params)))
-             (when (equal (alist-get 'sessionUpdate update) "agent_message_chunk")
-               (let-alist update
-                 (setq response-text (concat response-text .content.text)))))))))
-    
-    ;; Subscribe to errors
-    (acp-subscribe-to-errors
-     :client client
-     :buffer (current-buffer)
-     :on-error
-     (lambda (err)
-       (setq error-occurred t)
-       (setq response-complete t)
-       (message "Agent error: %S" err)))
-    
-    (unwind-protect
-        (progn
-          ;; Initialize
-          (message "Handshaking with agent...")
-          (acp-send-request
-           :client client
-           :sync t
-           :request (acp-make-initialize-request
-                     :protocol-version 1
-                     :read-text-file-capability nil
-                     :write-text-file-capability nil))
-          
-          ;; Create session
-          (message "Creating session...")
-          (let ((session-response
-                 (acp-send-request
-                  :client client
-                  :sync t
-                  :request (acp-make-session-new-request
-                            :cwd default-directory
-                            :mcp-servers []))))
-            (setq session-id (alist-get 'sessionId session-response)))
-          
-          ;; Send prompt
-          (message "Sending review request...")
-          (acp-send-request
-           :client client
-           :sync nil
-           :request (acp-make-session-prompt-request
-                     :session-id session-id
-                     :prompt (vector (list (cons 'type "text")
-                                           (cons 'text (agent-review--make-review-prompt changes)))))
-           :on-success
-           (lambda (_result)
-             (setq response-complete t))
-           :on-failure
-           (lambda (err)
-             (setq error-occurred t)
-             (setq response-complete t)
-             (message "Review request failed: %S" err)))
-          
-          ;; Wait for response
-          (while (not response-complete)
-            (accept-process-output nil 0.1))
-          
-          (when error-occurred
-            (error "Agent review failed"))
-          
-          response-text)
-      
-      ;; Cleanup
-      (when session-id
+(defvar-local agent-review--session-id nil
+  "Current review session ID.")
+
+(defvar-local agent-review--session-response-text nil
+  "Accumulated response text from current review session.")
+
+(defun agent-review--cleanup-session (buffer)
+  "Clean up review session in BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when agent-review--session-id
         (ignore-errors
           (acp-send-notification
-           :client client
+           :client agent-review--session-client
            :notification (acp-make-session-cancel-notification
-                          :session-id session-id
+                          :session-id agent-review--session-id
                           :reason "Review complete"))))
-      (ignore-errors
-        (acp-shutdown :client client)))))
+      (when agent-review--session-client
+        (ignore-errors
+          (acp-shutdown :client agent-review--session-client)))
+      (setq agent-review--session-client nil
+            agent-review--session-id nil
+            agent-review--session-response-text nil))))
+
+(defun agent-review--request-review-async (changes config on-complete)
+  "Send CHANGES to agent using CONFIG and call ON-COMPLETE when done.
+ON-COMPLETE is called with (response-text error) where error is nil on success."
+  (let* ((work-buffer (generate-new-buffer " *agent-review-work*"))
+         (client nil)
+         (session-id nil))
+    
+    (with-current-buffer work-buffer
+      (setq agent-review--session-response-text "")
+      
+      ;; Create client
+      (setq client (funcall (alist-get :client-maker config) work-buffer))
+      (setq agent-review--session-client client)
+      
+      ;; Subscribe to notifications to capture agent output
+      (acp-subscribe-to-notifications
+       :client client
+       :buffer work-buffer
+       :on-notification
+       (lambda (notification)
+         (when (buffer-live-p work-buffer)
+           (with-current-buffer work-buffer
+             (let-alist notification
+               (when (equal .method "session/update")
+                 (let ((update (alist-get 'update .params)))
+                   (when (equal (alist-get 'sessionUpdate update) "agent_message_chunk")
+                     (let-alist update
+                       (setq agent-review--session-response-text
+                             (concat agent-review--session-response-text .content.text)))))))))))
+      
+      ;; Subscribe to errors
+      (acp-subscribe-to-errors
+       :client client
+       :buffer work-buffer
+       :on-error
+       (lambda (err)
+         (let ((response agent-review--session-response-text))
+           (agent-review--cleanup-session work-buffer)
+           (kill-buffer work-buffer)
+           (funcall on-complete nil (format "Agent error: %S" err)))))
+      
+      ;; Initialize (async)
+      (message "Handshaking with agent...")
+      (acp-send-request
+       :client client
+       :sync nil
+       :request (acp-make-initialize-request
+                 :protocol-version 1
+                 :read-text-file-capability nil
+                 :write-text-file-capability nil)
+       :on-success
+       (lambda (_result)
+         (when (buffer-live-p work-buffer)
+           ;; Create session (async)
+           (message "Creating session...")
+           (acp-send-request
+            :client client
+            :sync nil
+            :request (acp-make-session-new-request
+                      :cwd default-directory
+                      :mcp-servers [])
+            :on-success
+            (lambda (session-response)
+              (when (buffer-live-p work-buffer)
+                (with-current-buffer work-buffer
+                  (setq session-id (alist-get 'sessionId session-response))
+                  (setq agent-review--session-id session-id)
+                  
+                  ;; Send prompt (async)
+                  (message "Sending review request...")
+                  (acp-send-request
+                   :client client
+                   :sync nil
+                   :request (acp-make-session-prompt-request
+                             :session-id session-id
+                             :prompt (vector (list (cons 'type "text")
+                                                   (cons 'text (agent-review--make-review-prompt changes)))))
+                   :on-success
+                   (lambda (_result)
+                     (when (buffer-live-p work-buffer)
+                       (let ((response (with-current-buffer work-buffer
+                                         agent-review--session-response-text)))
+                         (agent-review--cleanup-session work-buffer)
+                         (kill-buffer work-buffer)
+                         (funcall on-complete response nil))))
+                   :on-failure
+                   (lambda (err)
+                     (agent-review--cleanup-session work-buffer)
+                     (kill-buffer work-buffer)
+                     (funcall on-complete nil (format "Review request failed: %S" err)))))))
+            :on-failure
+            (lambda (err)
+              (agent-review--cleanup-session work-buffer)
+              (kill-buffer work-buffer)
+              (funcall on-complete nil (format "Session creation failed: %S" err))))))
+       :on-failure
+       (lambda (err)
+         (agent-review--cleanup-session work-buffer)
+         (kill-buffer work-buffer)
+         (funcall on-complete nil (format "Initialization failed: %S" err)))))))
+
 
 ;;; Response Parser
 
@@ -268,7 +299,7 @@ Returns list of issue plists sorted by file, then severity."
   (pcase severity
     ("error" 'error)
     ("warning" 'warning)
-    ("suggestion" 'info)
+    ("suggestion" 'success)
     (_ 'default)))
 
 (defun agent-review--format-entry (issue)
@@ -299,7 +330,7 @@ Returns list of issue plists sorted by file, then severity."
       (message "File not found: %s" file))))
 
 (defun agent-review-refresh ()
-  "Re-run the code review."
+  "Re-run the code review asynchronously."
   (interactive)
   (call-interactively #'agent-review))
 
@@ -342,34 +373,70 @@ Returns list of issue plists sorted by file, then severity."
 
 ;;;###autoload
 (defun agent-review (&optional config)
-  "Review current git changes using AI agent.
+  "Review current git changes using AI agent asynchronously.
 With optional CONFIG, use that agent configuration.
-Otherwise, prompt to select from `agent-shell-agent-configs'."
+Otherwise, prompt to select from `agent-shell-agent-configs'.
+
+This function returns immediately and displays results when ready,
+allowing Emacs to remain responsive during the review."
   (interactive)
   (let* ((agent-config (or config
                            (agent-shell-select-config
                             :prompt "Select agent for review: ")))
-         (changes nil)
-         (response nil)
-         (issues nil))
+         (changes nil))
     
-    ;; Collect changes
+    ;; Collect changes synchronously (fast operation)
     (message "Collecting git changes...")
     (setq changes (agent-review--get-git-changes))
     
-    ;; Request review
+    ;; Show progress buffer
+    (let ((progress-buffer (get-buffer-create "*Agent Review*")))
+      (with-current-buffer progress-buffer
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert "Agent Review in Progress\n")
+          (insert "=======================\n\n")
+          (insert (format "Agent: %s\n"
+                          (or (alist-get :mode-line-name agent-config)
+                              (alist-get :buffer-name agent-config)
+                              "agent")))
+          (insert "Status: Initializing...\n\n")
+          (insert "Please wait while the agent reviews your changes.\n")
+          (insert "Emacs will remain responsive during this process.\n"))
+        (special-mode))
+      (display-buffer progress-buffer))
+    
+    ;; Request review asynchronously
     (message "Requesting review from %s..."
              (or (alist-get :mode-line-name agent-config)
                  (alist-get :buffer-name agent-config)
                  "agent"))
-    (setq response (agent-review--request-review changes agent-config))
     
-    ;; Parse and display
-    (setq issues (agent-review--parse-issues response))
-    
-    (if issues
-        (agent-review--display-issues issues)
-      (message "No issues found in review"))))
+    (agent-review--request-review-async
+     changes
+     agent-config
+     (lambda (response error-msg)
+       (if error-msg
+           (progn
+             (message "Review failed: %s" error-msg)
+             (with-current-buffer (get-buffer-create "*Agent Review*")
+               (let ((inhibit-read-only t))
+                 (erase-buffer)
+                 (insert "Agent Review Failed\n")
+                 (insert "===================\n\n")
+                 (insert (format "Error: %s\n" error-msg)))
+               (special-mode)))
+         (let ((issues (agent-review--parse-issues response)))
+           (if issues
+               (agent-review--display-issues issues)
+             (message "No issues found in review")
+             (with-current-buffer (get-buffer-create "*Agent Review*")
+               (let ((inhibit-read-only t))
+                 (erase-buffer)
+                 (insert "Agent Review Complete\n")
+                 (insert "=====================\n\n")
+                 (insert "No issues found in review.\n"))
+               (special-mode)))))))))
 
 (provide 'agent-review)
 

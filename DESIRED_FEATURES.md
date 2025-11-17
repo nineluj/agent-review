@@ -8,3 +8,6 @@ an agent-shell prompt to get them implemented.
 
 ## Mention agent-shell and acp.el in the readme
 Add donation links for xenodium for doing all the hard work.
+
+## Explain project rationale
+Common use case of using one agent (ie claude) to write changes and then using codex 5.1 to review changes. Making this more streamlined.
