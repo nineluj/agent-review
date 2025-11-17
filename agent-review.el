@@ -297,9 +297,9 @@ Returns list of issue plists sorted by file, then severity."
 (defun agent-review--severity-face (severity)
   "Return face for SEVERITY level."
   (pcase severity
-    ("error" 'error)
-    ("warning" 'warning)
-    ("suggestion" 'success)
+    ("error" 'compilation-error)
+    ("warning" 'compilation-warning)
+    ("suggestion" 'compilation-info)
     (_ 'default)))
 
 (defun agent-review--format-entry (issue)
@@ -394,15 +394,23 @@ allowing Emacs to remain responsive during the review."
       (with-current-buffer progress-buffer
         (let ((inhibit-read-only t))
           (erase-buffer)
+          (insert "       _---~~(~~-_.\n")
+          (insert "     _{        )   )\n")
+          (insert "   ,   ) -~~- ( ,-' )_\n")
+          (insert "  (  `-,_..`., )-- '_,)\n")
+          (insert " ( ` _)  (  -~( -_ `,  }\n")
+          (insert " (_-  _  ~_-~~~~`,  ,' )\n")
+          (insert "   `~ -^(    __;-,((()))\n")
+          (insert "         ~~~~ {_ -_(())\n")
+          (insert "                `\\  }\n")
+          (insert "                  { }\n\n")
           (insert "Agent Review in Progress\n")
-          (insert "=======================\n\n")
+          (insert "========================\n\n")
           (insert (format "Agent: %s\n"
                           (or (alist-get :mode-line-name agent-config)
                               (alist-get :buffer-name agent-config)
                               "agent")))
-          (insert "Status: Initializing...\n\n")
-          (insert "Please wait while the agent reviews your changes.\n")
-          (insert "Emacs will remain responsive during this process.\n"))
+          (insert "Status: Thinking...\n\n"))
         (special-mode))
       (display-buffer progress-buffer))
     
