@@ -4,6 +4,8 @@
 Allow rows to be selected (ie m, M, u, U like in dired) and a keybind to send them over to the
 an agent-shell prompt to get them implemented.
 
+Copying these rows (W), should yank text (potentially multiple rows) in a format that is easy for an agent to understand for the implementation. 
+
 ## Add GPL-3.0 license
 
 ## Mention agent-shell and acp.el in the readme

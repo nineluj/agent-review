@@ -137,6 +137,37 @@ Returns alist with :staged and :unstaged keys."
 (defvar-local agent-review--session-response-text nil
   "Accumulated response text from current review session.")
 
+(defvar agent-review--status-buffer nil
+  "Buffer showing current review status.")
+
+(defun agent-review--update-status-buffer (status)
+  "Update the status buffer with STATUS message."
+  (when (and agent-review--status-buffer
+             (buffer-live-p agent-review--status-buffer))
+    (with-current-buffer agent-review--status-buffer
+      (let ((inhibit-read-only t))
+        (setq tabulated-list-entries
+              (list (list 'status (vector status))))
+        (tabulated-list-print t)
+        (goto-char (point-min)))))
+  (force-mode-line-update t))
+
+(defun agent-review--show-status-buffer (agent-name)
+  "Create and display status buffer for AGENT-NAME."
+  (let ((buffer (get-buffer-create "*Agent Review*")))
+    (with-current-buffer buffer
+      (agent-review-mode)
+      (setq tabulated-list-format [("Status" 0 nil)])
+      (setq tabulated-list-padding 2)
+      (tabulated-list-init-header)
+      (setq tabulated-list-entries
+            (list (list 'status (vector (format "Starting review with %s..." agent-name)))))
+      (tabulated-list-print t)
+      (goto-char (point-min)))
+    (setq agent-review--status-buffer buffer)
+    (display-buffer buffer)
+    buffer))
+
 (defun agent-review--cleanup-session (buffer)
   "Clean up review session in BUFFER."
   (when (buffer-live-p buffer)
@@ -197,6 +228,7 @@ ON-COMPLETE is called with (response-text error) where error is nil on success."
            (funcall on-complete nil (format "Agent error: %S" err)))))
       
       ;; Initialize (async)
+      (agent-review--update-status-buffer "Handshaking with agent...")
       (message "Handshaking with agent...")
       (acp-send-request
        :client client
@@ -209,6 +241,7 @@ ON-COMPLETE is called with (response-text error) where error is nil on success."
        (lambda (_result)
          (when (buffer-live-p work-buffer)
            ;; Create session (async)
+           (agent-review--update-status-buffer "Creating session...")
            (message "Creating session...")
            (acp-send-request
             :client client
@@ -224,6 +257,7 @@ ON-COMPLETE is called with (response-text error) where error is nil on success."
                   (setq agent-review--session-id session-id)
                   
                   ;; Send prompt (async)
+                  (agent-review--update-status-buffer "Agent is thinking...")
                   (message "Sending review request...")
                   (acp-send-request
                    :client client
@@ -396,30 +430,11 @@ allowing Emacs to remain responsive during the review."
     (message "Collecting git changes...")
     (setq changes (agent-review--get-git-changes))
     
-    ;; Show progress buffer
-    (let ((progress-buffer (get-buffer-create "*Agent Review*")))
-      (with-current-buffer progress-buffer
-        (let ((inhibit-read-only t))
-          (erase-buffer)
-          (insert "       _---~~(~~-_.\n")
-          (insert "     _{        )   )\n")
-          (insert "   ,   ) -~~- ( ,-' )_\n")
-          (insert "  (  `-,_..`., )-- '_,)\n")
-          (insert " ( ` _)  (  -~( -_ `,  }\n")
-          (insert " (_-  _  ~_-~~~~`,  ,' )\n")
-          (insert "   `~ -^(    __;-,((()))\n")
-          (insert "         ~~~~ {_ -_(())\n")
-          (insert "                `\\  }\n")
-          (insert "                  { }\n\n")
-          (insert "Agent Review in Progress\n")
-          (insert "========================\n\n")
-          (insert (format "Agent: %s\n"
-                          (or (alist-get :mode-line-name agent-config)
-                              (alist-get :buffer-name agent-config)
-                              "agent")))
-          (insert "Status: Thinking...\n\n"))
-        (special-mode))
-      (display-buffer progress-buffer))
+    ;; Show status buffer
+    (agent-review--show-status-buffer
+     (or (alist-get :mode-line-name agent-config)
+         (alist-get :buffer-name agent-config)
+         "agent"))
     
     ;; Request review asynchronously
     (message "Requesting review from %s..."
@@ -434,25 +449,30 @@ allowing Emacs to remain responsive during the review."
        (if error-msg
            (progn
              (message "Review failed: %s" error-msg)
-             (with-current-buffer (get-buffer-create "*Agent Review*")
-               (let ((inhibit-read-only t))
-                 (erase-buffer)
-                 (insert "Agent Review Failed\n")
-                 (insert "===================\n\n")
-                 (insert (format "Error: %s\n" error-msg)))
-               (special-mode)))
+             (when (buffer-live-p agent-review--status-buffer)
+               (with-current-buffer agent-review--status-buffer
+                 (let ((inhibit-read-only t))
+                   (setq tabulated-list-format [("Status" 0 nil)])
+                   (tabulated-list-init-header)
+                   (setq tabulated-list-entries
+                         (list (list 'status (vector (format "Review failed: %s" error-msg)))))
+                   (tabulated-list-print t)
+                   (setq agent-review--agent-config agent-config)
+                   (goto-char (point-min))))))
          (let ((issues (agent-review--parse-issues response)))
            (if issues
                (agent-review--display-issues issues agent-config)
              (message "No issues found in review")
-             (with-current-buffer (get-buffer-create "*Agent Review*")
-               (let ((inhibit-read-only t))
-                 (erase-buffer)
-                 (insert "Agent Review Complete\n")
-                 (insert "=====================\n\n")
-                 (insert "No issues found in review.\n"))
-               (setq agent-review--agent-config agent-config)
-               (special-mode)))))))))
+             (when (buffer-live-p agent-review--status-buffer)
+               (with-current-buffer agent-review--status-buffer
+                 (let ((inhibit-read-only t))
+                   (setq tabulated-list-format [("Status" 0 nil)])
+                   (tabulated-list-init-header)
+                   (setq tabulated-list-entries
+                         (list (list 'status (vector "Review complete: No issues found"))))
+                   (tabulated-list-print t)
+                   (setq agent-review--agent-config agent-config)
+                   (goto-char (point-min))))))))))))
 
 (provide 'agent-review)
 
