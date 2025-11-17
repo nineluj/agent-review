@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2025
 
-;; Author: Julian Luj
+;; Author: nineluj
 ;; URL: https://github.com/nineluj/agent-review
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "29.1") (acp "0.7.1") (agent-shell "0.17.2"))
