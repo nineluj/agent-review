@@ -5,7 +5,7 @@
 ;; Author: nineluj
 ;; URL: https://github.com/nineluj/agent-review
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (acp "0.7.1") (agent-shell "0.17.2"))
+;; Package-Requires: ((emacs "29.1") (acp "0.7.1") (agent-shell "0.16.2"))
 
 ;; This package is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -58,6 +58,10 @@
 
 (defvar-local agent-review--agent-config nil
   "Agent configuration used for the current review.")
+
+(defvar-local agent-review--marked-issues nil
+  "Hash table tracking marked issues (issue plist -> t).
+Used to track which issues are selected for batch operations.")
 
 ;;; Git Integration
 
@@ -339,10 +343,16 @@ Returns list of issue plists sorted by file, then severity."
     ("suggestion" 'compilation-info)
     (_ 'default)))
 
+(defun agent-review--issue-marked-p (issue)
+  "Return non-nil if ISSUE is marked."
+  (and agent-review--marked-issues
+       (gethash issue agent-review--marked-issues)))
+
 (defun agent-review--format-entry (issue)
   "Format ISSUE as tabulated-list entry."
   (list issue
         (vector
+         (if (agent-review--issue-marked-p issue) "*" " ")
          (propertize (plist-get issue :severity)
                      'font-lock-face (agent-review--severity-face
                                       (plist-get issue :severity)))
@@ -373,20 +383,149 @@ Returns list of issue plists sorted by file, then severity."
       (agent-review agent-review--agent-config)
     (call-interactively #'agent-review)))
 
+;;; Selection Interface
+
+(defun agent-review--init-marks ()
+  "Initialize the marks hash table if not already created."
+  (unless agent-review--marked-issues
+    (setq agent-review--marked-issues (make-hash-table :test 'equal))))
+
+(defun agent-review-mark ()
+  "Mark the issue at point and move to the next line."
+  (interactive)
+  (when-let ((issue (tabulated-list-get-id)))
+    (agent-review--init-marks)
+    (puthash issue t agent-review--marked-issues)
+    (tabulated-list-set-col 0 (if (agent-review--issue-marked-p issue) "*" " ") t)
+    (forward-line 1)))
+
+(defun agent-review-unmark ()
+  "Unmark the issue at point and move to the next line."
+  (interactive)
+  (when-let ((issue (tabulated-list-get-id)))
+    (when agent-review--marked-issues
+      (remhash issue agent-review--marked-issues))
+    (tabulated-list-set-col 0 (if (agent-review--issue-marked-p issue) "*" " ") t)
+    (forward-line 1)))
+
+(defun agent-review-mark-all ()
+  "Mark all issues in the buffer."
+  (interactive)
+  (agent-review--init-marks)
+  (save-excursion
+    (goto-char (point-min))
+    (while (not (eobp))
+      (when-let ((issue (tabulated-list-get-id)))
+        (puthash issue t agent-review--marked-issues)
+        (tabulated-list-set-col 0 "*" t))
+      (forward-line 1)))
+  (message "Marked all issues"))
+
+(defun agent-review-unmark-all ()
+  "Unmark all issues in the buffer."
+  (interactive)
+  (when agent-review--marked-issues
+    (clrhash agent-review--marked-issues))
+  (save-excursion
+    (goto-char (point-min))
+    (while (not (eobp))
+      (when (tabulated-list-get-id)
+        (tabulated-list-set-col 0 " " t))
+      (forward-line 1)))
+  (message "Unmarked all issues"))
+
+(defun agent-review--get-marked-issues ()
+  "Return list of marked issues, or issue at point if none marked."
+  (if (and agent-review--marked-issues
+           (> (hash-table-count agent-review--marked-issues) 0))
+      (let ((marked '()))
+        (maphash (lambda (issue _v) (push issue marked))
+                 agent-review--marked-issues)
+        (nreverse marked))
+    ;; No marks, return current issue if any
+    (when-let ((issue (tabulated-list-get-id)))
+      (list issue))))
+
+(defun agent-review--format-issue-for-agent (issue)
+  "Format ISSUE plist into agent-friendly text."
+  (format "%s:%d [%s] %s"
+          (plist-get issue :file)
+          (plist-get issue :line)
+          (upcase (plist-get issue :severity))
+          (plist-get issue :description)))
+
+(defun agent-review-copy-issues ()
+  "Copy marked issues (or issue at point) in agent-friendly format.
+The format is designed to be easily understood by AI agents for
+implementing fixes."
+  (interactive)
+  (let ((issues (agent-review--get-marked-issues)))
+    (if issues
+        (let ((text (mapconcat #'agent-review--format-issue-for-agent
+                               issues
+                               "\n")))
+          (kill-new text)
+          (message "Copied %d issue%s to kill ring"
+                   (length issues)
+                   (if (= (length issues) 1) "" "s")))
+      (message "No issues to copy"))))
+
+(defun agent-review-send-to-agent-shell ()
+  "Send marked issues (or issue at point) to agent-shell for implementation.
+If no agent-shell is open in the current project, starts a new one."
+  (interactive)
+  (let ((issues (agent-review--get-marked-issues)))
+    (if issues
+        (let* ((prompt-header "Implement fixes for the following code review issues:\n\n")
+               (issues-text (mapconcat #'agent-review--format-issue-for-agent
+                                       issues
+                                       "\n"))
+               (full-text (concat prompt-header issues-text "\n")))
+          ;; Check if an agent-shell exists, if not start one
+          (condition-case err
+              (progn
+                (agent-shell-insert :text full-text)
+                (message "Sent %d issue%s to agent-shell"
+                         (length issues)
+                         (if (= (length issues) 1) "" "s")))
+            (error
+             ;; No agent-shell available, start one and try again
+             (if (y-or-n-p "No agent shell found. Start one? ")
+                 (progn
+                   (agent-shell-start :config (agent-shell-select-config
+                                               :prompt "Select agent: "))
+                   ;; Wait a moment for shell to initialize, then insert
+                   (run-with-timer 1.0 nil
+                                   (lambda (text)
+                                     (condition-case err2
+                                         (agent-shell-insert :text text)
+                                       (error
+                                        (message "Failed to send to agent-shell: %s" (error-message-string err2)))))
+                                   full-text))
+               (message "Cancelled")))))
+      (message "No issues to send"))))
+
 (defvar-keymap agent-review-mode-map
   :doc "Keymap for `agent-review-mode'."
   :parent tabulated-list-mode-map
   "RET" #'agent-review-jump-to-issue
   "g" #'agent-review-refresh
   "n" #'next-line
-  "p" #'previous-line)
+  "p" #'previous-line
+  "m" #'agent-review-mark
+  "u" #'agent-review-unmark
+  "M" #'agent-review-mark-all
+  "U" #'agent-review-unmark-all
+  "W" #'agent-review-copy-issues
+  "S" #'agent-review-send-to-agent-shell)
 
 (define-derived-mode agent-review-mode tabulated-list-mode "Agent Review"
   "Major mode for displaying AI code review results.
 
 \\{agent-review-mode-map}"
   (setq tabulated-list-format
-        [("Severity" 10 t)
+        [("" 1 nil)  ; Mark column
+         ("Severity" 10 t)
          ("File" 30 t)
          ("Line" 6 t :right-align t)
          ("Description" 0 nil)])
@@ -401,6 +540,8 @@ AGENT-CONFIG is stored for refresh operations."
       (agent-review-mode)
       (setq agent-review--current-issues issues)
       (setq agent-review--agent-config agent-config)
+      ;; Clear marks when displaying new results
+      (setq agent-review--marked-issues nil)
       (setq tabulated-list-entries
             (mapcar #'agent-review--format-entry issues))
       (tabulated-list-print t)
