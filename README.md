@@ -1,24 +1,11 @@
 # agent-review.el
 
-AI-powered code review for git changes using ACP (Agent Client Protocol).
-
+## Overview
 https://github.com/user-attachments/assets/8ad86c2d-a91e-4f69-b51a-0f7f72ae0b19
 
-## Overview
+`agent-review` enables a streamlined workflow: use one AI agent (Claude, Cursor, Gemini) to implement features, then instantly get a second opinion from a different agent. The package automatically collects your git changes and sends them to your chosen AI agent for review. The cross-agent review catches issues that single-agent workflows miss, while the tight feedback loop means you fix problems quicker and more efficiently.
 
-`agent-review` analyzes your staged and unstaged git changes using AI agents (Claude Code, Cursor, Gemini, etc.) and displays findings in a navigable list interface.
-
-## Features
-
-- Non-interactive code review (just shows results, no chat)
-- Reviews both staged and unstaged changes together
-- Displays issues by severity: error, warning, suggestion
-- Jump directly to issue locations in files
-- Mark/unmark issues for batch operations
-- Copy issues in agent-friendly format
-- Send issues directly to agent-shell for implementation
-- Uses agent-shell's configuration system
-- Works with any ACP-compatible agent
+All findings display in a navigable list interface where you can jump to issues, triage by severity, and send fixes back to your implementation agent—closing the loop without leaving Emacs.
 
 ## Requirements
 
@@ -29,6 +16,8 @@ https://github.com/user-attachments/assets/8ad86c2d-a91e-4f69-b51a-0f7f72ae0b19
 - An ACP-compatible agent (Claude Code, Cursor, Gemini CLI, etc.)
 
 This package builds on the excellent work by [xenodium](https://github.com/xenodium) on acp.el and agent-shell. Consider [supporting their work](https://github.com/sponsors/xenodium)!
+
+For setting up individual agents (Claude Code, Cursor, Gemini CLI, etc.), follow the [agent-shell setup guide](https://github.com/xenodium/agent-shell?tab=readme-ov-file#setup).
 
 ## Installation
 
@@ -136,15 +125,6 @@ Install git or configure `agent-review-git-executable`.
 ### No issues found but changes exist
 
 The agent may not have found any issues, or the response parsing failed. Check the agent's actual response format.
-
-## Project Rationale
-
-A common workflow is to use one AI agent (e.g., Claude) to write code changes, then use another agent (e.g., Codex 5.1) to review those changes. This package streamlines that workflow by:
-
-1. Automatically collecting git changes
-2. Sending them to your chosen AI agent for review
-3. Presenting the results in an organized, navigable format
-4. Allowing you to send issues back to an agent for fixes
 
 ## Contributing
 
