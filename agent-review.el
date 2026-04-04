@@ -1167,17 +1167,23 @@ Each entry is (buffer name status)."
   "List all Agent Review buffers and their statuses.
 Displays in a side window for easy navigation."
   (interactive)
-  (let ((reviews (agent-review--collect-review-buffers))
-        (buffer (get-buffer-create "*Agent Reviews*")))
-    (if (null reviews)
-        (message "No Agent Review buffers open")
-      (with-current-buffer buffer
-        (agent-review-list-mode)
-        (agent-review-list-reviews-revert)
-        (tabulated-list-print t)
-        (goto-char (point-min)))
-      (display-buffer-in-side-window buffer '((side . bottom)
-                                              (window-height . 0.3))))))
+  (let ((buffer (get-buffer "*Agent Reviews*")))
+    ;; If buffer is visible, hide it (toggle off)
+    (if (and buffer (get-buffer-window buffer))
+        (delete-window (get-buffer-window buffer))
+      ;; Otherwise, show it (toggle on)
+      (let ((reviews (agent-review--collect-review-buffers)))
+        (if (null reviews)
+            (message "No Agent Review buffers open")
+          (setq buffer (get-buffer-create "*Agent Reviews*"))
+          (with-current-buffer buffer
+            (agent-review-list-mode)
+            (agent-review-list-reviews-revert)
+            (tabulated-list-print t)
+            (goto-char (point-min)))
+          (select-window
+           (display-buffer-in-side-window buffer '((side . bottom)
+                                                   (window-height . 0.3)))))))))
 
 ;;; Entry Point
 
