@@ -131,6 +131,34 @@ Returns alist with :staged and :unstaged keys."
     (list (cons :staged staged)
           (cons :unstaged unstaged))))
 
+(defun agent-review--parse-pr-url (url)
+  "Parse a GitHub PR URL into (OWNER/REPO . NUMBER).
+URL should be like https://github.com/owner/repo/pull/123."
+  (if (string-match "github\\.com/\\([^/]+/[^/]+\\)/pull/\\([0-9]+\\)" url)
+      (cons (match-string 1 url)
+            (match-string 2 url))
+    (user-error "Invalid GitHub PR URL: %s" url)))
+
+(defun agent-review--get-pr-diff (pr-url)
+  "Fetch the diff for a GitHub PR at PR-URL using the gh CLI.
+Returns a changes alist with a :pr-diff key."
+  (unless (executable-find "gh")
+    (user-error "gh CLI not found.  Install it from https://cli.github.com"))
+  (let* ((parsed (agent-review--parse-pr-url pr-url))
+         (repo (car parsed))
+         (number (cdr parsed)))
+    (with-temp-buffer
+      (let ((exit-code (call-process "gh" nil t nil
+                                     "pr" "diff" number
+                                     "--repo" repo)))
+        (if (zerop exit-code)
+            (let ((diff (buffer-string)))
+              (if (string-empty-p (string-trim diff))
+                  (user-error "PR %s#%s has no diff" repo number)
+                (list (cons :pr-diff diff))))
+          (error "gh pr diff failed (exit %d): %s"
+                 exit-code (string-trim (buffer-string))))))))
+
 ;;; Agent Integration
 
 (defun agent-review--changed-files (diff-text)
@@ -181,6 +209,10 @@ Returns a string with each file preceded by a header and numbered lines."
 (defun agent-review--format-changes-for-prompt (changes)
   "Format CHANGES alist into text for agent prompt."
   (let ((parts '()))
+    (when-let ((pr-diff (alist-get :pr-diff changes)))
+      (push "=== Pull Request Diff ===\n\n" parts)
+      (push pr-diff parts)
+      (push "\n\n" parts))
     (when-let ((staged (alist-get :staged changes)))
       (push "=== Staged Changes (diff) ===\n\n" parts)
       (push staged parts)
@@ -1040,7 +1072,8 @@ Opens the *Agent Review Diagnostic* buffer in a side window."
   "W" #'agent-review-copy-issues
   "S" #'agent-review-send-to-agent-shell
   "e" #'agent-review-show-diagnostic
-  "l" #'agent-review-list-reviews)
+  "l" #'agent-review-list-reviews
+  "P" #'agent-review-pr)
 
 (define-derived-mode agent-review-mode tabulated-list-mode "Agent Review"
   "Major mode for displaying AI code review results.
@@ -1070,7 +1103,8 @@ Opens the *Agent Review Diagnostic* buffer in a side window."
     "W"  #'agent-review-copy-issues
     "S"  #'agent-review-send-to-agent-shell
     "e"  #'agent-review-show-diagnostic
-    "l"  #'agent-review-list-reviews))
+    "l"  #'agent-review-list-reviews
+    "P"  #'agent-review-pr))
 
 (defun agent-review--display-issues (issues agent-config review-buffer-name diagnostic-buffer-name)
   "Display ISSUES in a tabulated list buffer named REVIEW-BUFFER-NAME.
@@ -1246,6 +1280,77 @@ allowing Emacs to remain responsive during the review."
                  (alist-get :buffer-name agent-config)
                  "agent"))
     
+    (agent-review--request-review-async
+     changes
+     agent-config
+     status-buffer
+     (lambda (response detected-language error-msg)
+       (agent-review--stop-progress status-buffer)
+       (if error-msg
+           (progn
+             (message "Review failed: %s" error-msg)
+             (when (buffer-live-p status-buffer)
+               (with-current-buffer status-buffer
+                 (let ((inhibit-read-only t))
+                   (setq tabulated-list-format [("Status" 0 nil)])
+                   (tabulated-list-init-header)
+                   (setq tabulated-list-entries
+                         (list (list 'status (vector (format "Review failed: %s" error-msg)))))
+                   (tabulated-list-print t)
+                   (setq agent-review--agent-config agent-config)
+                   (goto-char (point-min))))))
+         (message "Detected language: %s" detected-language)
+         (let ((issues (agent-review--parse-issues response)))
+           (if issues
+               (agent-review--display-issues issues agent-config
+                                             review-buffer-name diagnostic-buffer-name)
+             (message "No issues found in review")
+             (when (buffer-live-p status-buffer)
+               (with-current-buffer status-buffer
+                 (let ((inhibit-read-only t))
+                   (setq tabulated-list-format [("Status" 0 nil)])
+                   (tabulated-list-init-header)
+                   (setq tabulated-list-entries
+                         (list (list 'status (vector "Review complete: No issues found"))))
+                   (tabulated-list-print t)
+                   (setq agent-review--agent-config agent-config)
+                   (goto-char (point-min))))))))))))
+
+;;;###autoload
+(defun agent-review-pr (pr-url &optional config)
+  "Review a GitHub Pull Request at PR-URL using an AI agent.
+Fetches the PR diff via `gh` CLI and sends it for review.
+Requires the PR branch to be checked out locally for full file context.
+With optional CONFIG, use that agent configuration."
+  (interactive "sGitHub PR URL: ")
+  (unless (condition-case nil
+              (agent-shell-project-buffers)
+            (error nil))
+    (user-error "No agent-shell session for this project.  Start one first with M-x agent-shell"))
+  (let* ((agent-config (or config
+                           (agent-shell-select-config
+                            :prompt "Select agent for review: ")))
+         (review-buffer-name (agent-review--buffer-name))
+         (diagnostic-buffer-name (agent-review--diagnostic-buffer-name))
+         (changes (progn
+                    (message "Fetching PR diff...")
+                    (agent-review--get-pr-diff pr-url)))
+         (status-buffer
+          (agent-review--show-status-buffer
+           review-buffer-name
+           (or (alist-get :mode-line-name agent-config)
+               (alist-get :buffer-name agent-config)
+               "agent"))))
+
+    ;; Start progress feedback
+    (agent-review--start-progress status-buffer)
+
+    ;; Request review asynchronously
+    (message "Requesting PR review from %s..."
+             (or (alist-get :mode-line-name agent-config)
+                 (alist-get :buffer-name agent-config)
+                 "agent"))
+
     (agent-review--request-review-async
      changes
      agent-config

@@ -185,6 +185,11 @@ This fork adds the following features on top of the upstream `nineluj/agent-revi
 - Full evil normal-state keybindings for review, diagnostic, and list modes
 - `gr` for refresh (avoids shadowing `gg`/`G`)
 
+### PR review by URL
+- `M-x agent-review-pr` (or `SPC q p`) reviews a GitHub Pull Request by URL
+- Fetches the diff via `gh` CLI, sends full file context from the locally checked-out branch
+- Requires the PR branch checked out locally and an agent-shell session open
+
 ### Investigate workflow
 - `I` in the diagnostic buffer prompts for a question, then sends it to agent-shell with the diagnostic as context
 
