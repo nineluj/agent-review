@@ -137,6 +137,52 @@ Install git or configure `agent-review-git-executable`.
 
 The agent may not have found any issues, or the response parsing failed. Check the agent's actual response format.
 
+## Fork Changes
+
+This fork adds the following features on top of the upstream `nineluj/agent-review`:
+
+### Language-aware reviews
+- Automatic programming language detection (Python, Clojure, TypeScript, or generic)
+- Language-specific review prompts loaded from `languages/*.md` files
+- Two-turn review: first detects language, then sends a tailored review prompt
+
+### Rich diagnostics
+- Issues now have both a **short description** (shown in the list) and a full **diagnostic** explanation
+- New diagnostic buffer (`e` key) renders the full diagnostic in a bottom side window with markdown formatting, hard-wrapped at 80 columns
+- Navigate between diagnostics with `n`/`p`, jump to file with `RET`, investigate with `I`
+
+### Full file context
+- Sends full file contents with line numbers alongside diffs, so the agent can report accurate line numbers instead of defaulting to 1
+
+### Animated progress feedback
+- Spinner animation with elapsed time while the review is in progress
+- Per-buffer progress state so concurrent reviews each have independent timers
+
+### Project-scoped buffers
+- Review buffers are named per-project: `*Agent Review @ project-name*`
+- Diagnostic buffers are similarly scoped: `*Agent Review Diagnostic @ project-name*`
+- Supports projectile, project.el, and falls back to directory name
+
+### Concurrent review safety
+- All session state (status buffer, progress timer, buffer names) is captured in closures and buffer-local variables instead of globals
+- Running two reviews in different projects no longer overwrites each other's buffers
+
+### Agent-shell session guard
+- `agent-review` requires an existing `agent-shell` session for the project
+- Clear error message if no session exists: "Start one first with M-x agent-shell"
+
+### Review list manager
+- `M-x agent-review-list-reviews` (or `l` in review buffer) opens a bottom side window listing all review buffers with their status
+- Click or `RET` to jump to a review; `g` to refresh the list
+- Mouse support with highlight on hover
+
+### Evil mode support
+- Full evil normal-state keybindings for review, diagnostic, and list modes
+- `gr` for refresh (avoids shadowing `gg`/`G`)
+
+### Investigate workflow
+- `I` in the diagnostic buffer prompts for a question, then sends it to agent-shell with the diagnostic as context
+
 ## Contributing
 
 Issues and pull requests welcome at https://github.com/nineluj/agent-review
