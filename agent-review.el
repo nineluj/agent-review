@@ -1031,7 +1031,7 @@ diagnostic appended as context."
 
 (with-eval-after-load 'evil
   (evil-set-initial-state 'agent-review-diagnostic-mode 'normal)
-  (evil-define-key 'normal agent-review-diagnostic-mode-map
+  (evil-define-key* 'normal agent-review-diagnostic-mode-map
     (kbd "RET") #'agent-review-diagnostic-jump-to-issue
     "o"  #'agent-review-diagnostic-jump-to-issue
     "I"  #'agent-review-diagnostic-investigate
@@ -1090,7 +1090,7 @@ Opens the *Agent Review Diagnostic* buffer in a side window."
 
 (with-eval-after-load 'evil
   (evil-set-initial-state 'agent-review-mode 'normal)
-  (evil-define-key 'normal agent-review-mode-map
+  (evil-define-key* 'normal agent-review-mode-map
     (kbd "RET") #'agent-review-jump-to-issue
     "g"  nil  ; avoid shadowing evil gg/G
     "gr" #'agent-review-refresh
@@ -1214,7 +1214,7 @@ Each entry is (buffer name status)."
 
 (with-eval-after-load 'evil
   (evil-set-initial-state 'agent-review-list-mode 'normal)
-  (evil-define-key 'normal agent-review-list-mode-map
+  (evil-define-key* 'normal agent-review-list-mode-map
     (kbd "RET") #'agent-review-list-reviews-jump
     "q" #'quit-window))
 
