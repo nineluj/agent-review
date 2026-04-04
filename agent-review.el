@@ -53,6 +53,15 @@
   :type 'string
   :group 'agent-review)
 
+(defcustom agent-review-language-prompts-directory nil
+  "Directory containing custom language prompt files.
+When set, agent-review looks here first for language prompt files
+\(e.g. \"python.md\", \"clojure.md\") before falling back to the
+built-in prompts shipped with the package."
+  :type '(choice (const :tag "Use built-in prompts" nil)
+                 (directory :tag "Custom prompts directory"))
+  :group 'agent-review)
+
 (defun agent-review--project-name ()
   "Return the current project name.
 Uses projectile, project.el, or falls back to the directory name."
@@ -187,12 +196,25 @@ Returns a string with each file preceded by a header and numbered lines."
 
 (defun agent-review--load-language-prompt (language)
   "Load the review prompt file for LANGUAGE.
-Reads from the languages/ directory relative to the package install path.
-Falls back to \"other.txt\" if the language file does not exist."
-  (let* ((pkg-dir (file-name-directory (locate-library "agent-review")))
-         (lang-file (expand-file-name (format "languages/%s.md" language) pkg-dir))
-         (fallback (expand-file-name "languages/other.md" pkg-dir))
-         (file (if (file-exists-p lang-file) lang-file fallback)))
+Checks `agent-review-language-prompts-directory' first for a custom
+prompt file, then falls back to the built-in languages/ directory.
+Within each directory, falls back to \"other.md\" if no language-specific
+file exists."
+  (let* ((filename (format "%s.md" language))
+         (custom-dir (and agent-review-language-prompts-directory
+                         (expand-file-name agent-review-language-prompts-directory)))
+         (custom-file (and custom-dir
+                           (expand-file-name filename custom-dir)))
+         (custom-fallback (and custom-dir
+                               (expand-file-name "other.md" custom-dir)))
+         (pkg-dir (file-name-directory (locate-library "agent-review")))
+         (builtin-file (expand-file-name (concat "languages/" filename) pkg-dir))
+         (builtin-fallback (expand-file-name "languages/other.md" pkg-dir))
+         (file (cond
+                ((and custom-file (file-exists-p custom-file)) custom-file)
+                ((and custom-fallback (file-exists-p custom-fallback)) custom-fallback)
+                ((file-exists-p builtin-file) builtin-file)
+                (t builtin-fallback))))
     (with-temp-buffer
       (insert-file-contents file)
       (buffer-string))))

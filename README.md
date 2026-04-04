@@ -141,6 +141,11 @@ The agent may not have found any issues, or the response parsing failed. Check t
 
 This fork adds the following features on top of the upstream `nineluj/agent-review`:
 
+### Custom language prompts
+- Set `agent-review-language-prompts-directory` to load your own prompt files before built-in ones
+- Lookup order: custom dir (language-specific, then `other.md`) -> built-in `languages/` dir
+- Keep personal review directives out of the repo (e.g. `~/.doom.d/directives/`)
+
 ### Language-aware reviews
 - Automatic programming language detection (Python, Clojure, TypeScript, or generic)
 - Language-specific review prompts loaded from `languages/*.md` files
