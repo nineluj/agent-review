@@ -53,6 +53,12 @@
   :type 'string
   :group 'agent-review)
 
+(defcustom agent-review-save-directory
+  (expand-file-name "agent-review-saves" user-emacs-directory)
+  "Directory where saved reviews are stored."
+  :type 'directory
+  :group 'agent-review)
+
 (defcustom agent-review-language-prompts-directory nil
   "Directory containing custom language prompt files.
 When set, agent-review looks here first for language prompt files
@@ -906,6 +912,93 @@ Uses the gh CLI to create the issue in the current repository."
         (kill-new url)
         (message "Created GitHub issue: %s (URL copied)" url)))))
 
+;;; Save / Load Reviews
+
+(defun agent-review--save-file-path (project-name)
+  "Generate a save file path for PROJECT-NAME with a timestamp."
+  (let ((dir agent-review-save-directory)
+        (safe-name (replace-regexp-in-string "[^a-zA-Z0-9_-]" "_" project-name))
+        (timestamp (format-time-string "%Y%m%dT%H%M%S")))
+    (unless (file-directory-p dir)
+      (make-directory dir t))
+    (expand-file-name (format "%s-%s.eld" safe-name timestamp) dir)))
+
+(defun agent-review-save ()
+  "Save the current review to disk for later loading."
+  (interactive)
+  (unless agent-review--current-issues
+    (user-error "No issues to save"))
+  (let* ((project-name (agent-review--project-name))
+         (file (agent-review--save-file-path project-name))
+         (data (list :version 1
+                     :timestamp (format-time-string "%Y-%m-%dT%H:%M:%S")
+                     :project-directory default-directory
+                     :project-name project-name
+                     :agent-name (or (alist-get :mode-line-name agent-review--agent-config)
+                                     "unknown")
+                     :issues agent-review--current-issues)))
+    (with-temp-file file
+      (let ((print-level nil)
+            (print-length nil))
+        (prin1 data (current-buffer))))
+    (message "Review saved to %s" (abbreviate-file-name file))))
+
+(defun agent-review--list-saved-reviews ()
+  "Return alist of (display-label . file-path) for saved reviews."
+  (let ((dir agent-review-save-directory))
+    (unless (file-directory-p dir)
+      (user-error "No saved reviews (directory %s does not exist)" dir))
+    (let ((files (directory-files dir t "\\.eld\\'" t)))
+      (unless files
+        (user-error "No saved reviews found in %s" dir))
+      (mapcar
+       (lambda (file)
+         (condition-case nil
+             (let* ((data (with-temp-buffer
+                            (insert-file-contents file)
+                            (read (current-buffer))))
+                    (project (plist-get data :project-name))
+                    (agent (plist-get data :agent-name))
+                    (ts (plist-get data :timestamp))
+                    (n-issues (length (plist-get data :issues)))
+                    (label (format "%s  %s  %d issues  [%s]"
+                                   project ts n-issues agent)))
+               (cons label file))
+           (error (cons (format "(unreadable) %s" (file-name-nondirectory file))
+                        file))))
+       files))))
+
+(defun agent-review-load ()
+  "Load a previously saved review from disk."
+  (interactive)
+  (let* ((entries (agent-review--list-saved-reviews))
+         (choice (completing-read "Load review: " entries nil t))
+         (file (cdr (assoc choice entries)))
+         (data (with-temp-buffer
+                 (insert-file-contents file)
+                 (read (current-buffer))))
+         (project (plist-get data :project-name))
+         (issues (plist-get data :issues))
+         (project-dir (plist-get data :project-directory))
+         (review-buf (format "*Agent Review @ %s*" project))
+         (diag-buf (format "*Agent Review Diagnostic @ %s*" project)))
+    (unless issues
+      (user-error "Saved review contains no issues"))
+    (let ((default-directory (if (file-directory-p project-dir)
+                                 project-dir
+                               default-directory)))
+      (agent-review--display-issues issues nil review-buf diag-buf))))
+
+(defun agent-review-delete-saved ()
+  "Delete a saved review from disk."
+  (interactive)
+  (let* ((entries (agent-review--list-saved-reviews))
+         (choice (completing-read "Delete saved review: " entries nil t))
+         (file (cdr (assoc choice entries))))
+    (when (y-or-n-p (format "Delete %s? " (file-name-nondirectory file)))
+      (delete-file file)
+      (message "Deleted %s" (file-name-nondirectory file)))))
+
 ;;; Diagnostic Buffer
 
 (defvar-local agent-review-diagnostic--issue nil
@@ -1161,7 +1254,8 @@ Opens the *Agent Review Diagnostic* buffer in a side window."
   "l" #'agent-review-list-reviews
   "P" #'agent-review-pr
   "I" #'agent-review-create-github-issue
-  "d" #'agent-review-dismiss)
+  "d" #'agent-review-dismiss
+  "s" #'agent-review-save)
 
 (define-derived-mode agent-review-mode tabulated-list-mode "Agent Review"
   "Major mode for displaying AI code review results.
@@ -1194,7 +1288,8 @@ Opens the *Agent Review Diagnostic* buffer in a side window."
     "l"  #'agent-review-list-reviews
     "P"  #'agent-review-pr
     "I"  #'agent-review-create-github-issue
-    "d"  #'agent-review-dismiss))
+    "d"  #'agent-review-dismiss
+    "s"  #'agent-review-save))
 
 (defun agent-review--display-issues (issues agent-config review-buffer-name diagnostic-buffer-name)
   "Display ISSUES in a tabulated list buffer named REVIEW-BUFFER-NAME.
