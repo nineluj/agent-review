@@ -748,6 +748,24 @@ Returns list of issue plists sorted by file, then severity."
       (forward-line 1)))
   (message "Unmarked all issues"))
 
+(defun agent-review-dismiss ()
+  "Dismiss marked issues (or issue at point) as irrelevant.
+Removes them from the review buffer."
+  (interactive)
+  (let ((issues (agent-review--get-marked-issues)))
+    (unless issues
+      (user-error "No issue at point"))
+    (let ((count (length issues)))
+      (dolist (issue issues)
+        (setq agent-review--current-issues
+              (delete issue agent-review--current-issues))
+        (when agent-review--marked-issues
+          (remhash issue agent-review--marked-issues)))
+      (setq tabulated-list-entries
+            (mapcar #'agent-review--format-entry agent-review--current-issues))
+      (tabulated-list-print t)
+      (message "Dismissed %d issue%s" count (if (= count 1) "" "s")))))
+
 (defun agent-review--get-marked-issues ()
   "Return list of marked issues, or issue at point if none marked."
   (if (and agent-review--marked-issues
@@ -1073,7 +1091,8 @@ Opens the *Agent Review Diagnostic* buffer in a side window."
   "S" #'agent-review-send-to-agent-shell
   "e" #'agent-review-show-diagnostic
   "l" #'agent-review-list-reviews
-  "P" #'agent-review-pr)
+  "P" #'agent-review-pr
+  "d" #'agent-review-dismiss)
 
 (define-derived-mode agent-review-mode tabulated-list-mode "Agent Review"
   "Major mode for displaying AI code review results.
@@ -1104,7 +1123,8 @@ Opens the *Agent Review Diagnostic* buffer in a side window."
     "S"  #'agent-review-send-to-agent-shell
     "e"  #'agent-review-show-diagnostic
     "l"  #'agent-review-list-reviews
-    "P"  #'agent-review-pr))
+    "P"  #'agent-review-pr
+    "d"  #'agent-review-dismiss))
 
 (defun agent-review--display-issues (issues agent-config review-buffer-name diagnostic-buffer-name)
   "Display ISSUES in a tabulated list buffer named REVIEW-BUFFER-NAME.
