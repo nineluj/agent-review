@@ -165,6 +165,15 @@ Returns a changes alist with a :pr-diff key."
           (error "gh pr diff failed (exit %d): %s"
                  exit-code (string-trim (buffer-string))))))))
 
+(defun agent-review--get-commit-range-diff (commit-range)
+  "Get diff for COMMIT-RANGE (e.g. \"abc123..def456\").
+Returns a changes alist with a :commit-diff key."
+  (agent-review--check-git-repo)
+  (let ((diff (agent-review--get-git-diff (list commit-range))))
+    (unless diff
+      (user-error "No diff for commit range: %s" commit-range))
+    (list (cons :commit-diff diff))))
+
 ;;; Agent Integration
 
 (defun agent-review--changed-files (diff-text)
@@ -202,6 +211,8 @@ Returns a string with each file preceded by a header and numbered lines."
       (setq files (append files (agent-review--changed-files staged))))
     (when-let ((unstaged (alist-get :unstaged changes)))
       (setq files (append files (agent-review--changed-files unstaged))))
+    (when-let ((commit-diff (alist-get :commit-diff changes)))
+      (setq files (append files (agent-review--changed-files commit-diff))))
     (setq files (delete-dups files))
     (let ((parts '()))
       (dolist (file files)
@@ -218,6 +229,10 @@ Returns a string with each file preceded by a header and numbered lines."
     (when-let ((pr-diff (alist-get :pr-diff changes)))
       (push "=== Pull Request Diff ===\n\n" parts)
       (push pr-diff parts)
+      (push "\n\n" parts))
+    (when-let ((commit-diff (alist-get :commit-diff changes)))
+      (push "=== Commit Range Diff ===\n\n" parts)
+      (push commit-diff parts)
       (push "\n\n" parts))
     (when-let ((staged (alist-get :staged changes)))
       (push "=== Staged Changes (diff) ===\n\n" parts)
@@ -1255,7 +1270,8 @@ Opens the *Agent Review Diagnostic* buffer in a side window."
   "P" #'agent-review-pr
   "I" #'agent-review-create-github-issue
   "d" #'agent-review-dismiss
-  "s" #'agent-review-save)
+  "s" #'agent-review-save
+  "C" #'agent-review-commits)
 
 (define-derived-mode agent-review-mode tabulated-list-mode "Agent Review"
   "Major mode for displaying AI code review results.
@@ -1289,7 +1305,8 @@ Opens the *Agent Review Diagnostic* buffer in a side window."
     "P"  #'agent-review-pr
     "I"  #'agent-review-create-github-issue
     "d"  #'agent-review-dismiss
-    "s"  #'agent-review-save))
+    "s"  #'agent-review-save
+    "C"  #'agent-review-commits))
 
 (defun agent-review--display-issues (issues agent-config review-buffer-name diagnostic-buffer-name)
   "Display ISSUES in a tabulated list buffer named REVIEW-BUFFER-NAME.
@@ -1532,6 +1549,97 @@ With optional CONFIG, use that agent configuration."
 
     ;; Request review asynchronously
     (message "Requesting PR review from %s..."
+             (or (alist-get :mode-line-name agent-config)
+                 (alist-get :buffer-name agent-config)
+                 "agent"))
+
+    (agent-review--request-review-async
+     changes
+     agent-config
+     status-buffer
+     (lambda (response detected-language error-msg)
+       (agent-review--stop-progress status-buffer)
+       (if error-msg
+           (progn
+             (message "Review failed: %s" error-msg)
+             (when (buffer-live-p status-buffer)
+               (with-current-buffer status-buffer
+                 (let ((inhibit-read-only t))
+                   (setq tabulated-list-format [("Status" 0 nil)])
+                   (tabulated-list-init-header)
+                   (setq tabulated-list-entries
+                         (list (list 'status (vector (format "Review failed: %s" error-msg)))))
+                   (tabulated-list-print t)
+                   (setq agent-review--agent-config agent-config)
+                   (goto-char (point-min))))))
+         (message "Detected language: %s" detected-language)
+         (let ((issues (agent-review--parse-issues response)))
+           (if issues
+               (agent-review--display-issues issues agent-config
+                                             review-buffer-name diagnostic-buffer-name)
+             (message "No issues found in review")
+             (when (buffer-live-p status-buffer)
+               (with-current-buffer status-buffer
+                 (let ((inhibit-read-only t))
+                   (setq tabulated-list-format [("Status" 0 nil)])
+                   (tabulated-list-init-header)
+                   (setq tabulated-list-entries
+                         (list (list 'status (vector "Review complete: No issues found"))))
+                   (tabulated-list-print t)
+                   (setq agent-review--agent-config agent-config)
+                   (goto-char (point-min))))))))))))
+
+;;; Magit Integration
+
+(declare-function magit-region-values "magit-section" (&rest types))
+
+(defun agent-review--magit-commit-range ()
+  "Derive a commit range from the magit log buffer selection.
+Returns a string like \"older..newer\" or nil if not in a magit log buffer
+or no region is active."
+  (when (and (derived-mode-p 'magit-log-mode)
+             (use-region-p)
+             (fboundp 'magit-region-values))
+    (let ((commits (magit-region-values 'commit)))
+      (when (>= (length commits) 2)
+        ;; magit lists newest first, so last element is the oldest
+        (format "%s..%s" (car (last commits)) (car commits))))))
+
+(defun agent-review-commits (&optional commit-range config)
+  "Review changes in COMMIT-RANGE using an AI agent.
+COMMIT-RANGE is a git revision range like \"abc123..def456\".
+When called from a magit log buffer with a region, the range is
+derived automatically from the selected commits.
+With optional CONFIG, use that agent configuration."
+  (interactive
+   (list (or (agent-review--magit-commit-range)
+             (read-string "Commit range (e.g. HEAD~3..HEAD): "))))
+  (when (string-empty-p commit-range)
+    (user-error "No commit range specified"))
+  (unless (condition-case nil
+              (agent-shell-project-buffers)
+            (error nil))
+    (user-error "No agent-shell session for this project.  Start one first with M-x agent-shell"))
+  (let* ((agent-config (or config
+                           (agent-shell-select-config
+                            :prompt "Select agent for review: ")))
+         (review-buffer-name (agent-review--buffer-name))
+         (diagnostic-buffer-name (agent-review--diagnostic-buffer-name))
+         (changes (progn
+                    (message "Fetching diff for %s..." commit-range)
+                    (agent-review--get-commit-range-diff commit-range)))
+         (status-buffer
+          (agent-review--show-status-buffer
+           review-buffer-name
+           (or (alist-get :mode-line-name agent-config)
+               (alist-get :buffer-name agent-config)
+               "agent"))))
+
+    ;; Start progress feedback
+    (agent-review--start-progress status-buffer)
+
+    ;; Request review asynchronously
+    (message "Requesting commit range review from %s..."
              (or (alist-get :mode-line-name agent-config)
                  (alist-get :buffer-name agent-config)
                  "agent"))

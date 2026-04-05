@@ -73,6 +73,13 @@ Clone this repository and add to your load path:
 | U     | Unmark all issues                     |
 | W     | Copy marked issues to kill ring       |
 | S     | Send marked issues to agent-shell     |
+| e     | Show full diagnostic for issue        |
+| l     | List all review buffers               |
+| d     | Dismiss marked issues                 |
+| s     | Save review to disk                   |
+| P     | Review a GitHub PR by URL             |
+| C     | Review a commit range                 |
+| I     | Create GitHub issue from marked items |
 
 ### Programmatic Usage
 
@@ -192,6 +199,27 @@ This fork adds the following features on top of the upstream `nineluj/agent-revi
 
 ### Investigate workflow
 - `I` in the diagnostic buffer prompts for a question, then sends it to agent-shell with the diagnostic as context
+
+### Dismiss issues
+- `d` in the review buffer removes marked issues (or issue at point) from the list
+- Useful for triaging irrelevant findings without leaving the buffer
+
+### GitHub issue creation
+- `I` in the review buffer creates a GitHub issue from marked items (or issue at point) via `gh` CLI
+- Single issues get a detailed title with severity/file/line; multiple issues are grouped into one issue
+- URL is copied to the kill ring on success
+
+### Save / Load / Delete reviews
+- `s` in the review buffer saves the current review to disk (`.eld` files in `agent-review-save-directory`)
+- `M-x agent-review-load` restores a saved review with full navigation support
+- `M-x agent-review-delete-saved` removes a saved review from disk
+- Reviews persist across Emacs sessions; saved data includes project, agent, timestamp, and all issues
+
+### Commit range review (magit integration)
+- `M-x agent-review-commits` (or `C` in review buffer) reviews a range of already-committed changes
+- When called from a magit log buffer with a region, the commit range is derived automatically from the selected commits
+- Otherwise prompts for a range string (e.g. `HEAD~3..HEAD`)
+- Works without magit installed (falls back to manual input)
 
 ## Contributing
 
