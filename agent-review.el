@@ -1523,10 +1523,9 @@ compute faces, then copies them to the current buffer."
             "\n")
     ;; Separator
     (insert (propertize (make-string 72 ?─) 'face 'shadow) "\n\n")
-    ;; Diagnostic body (hard-wrapped at column 80, markdown fontified)
+    ;; Diagnostic body (markdown fontified)
     (let ((diag-start (point)))
       (insert diagnostic)
-      (agent-review-diagnostic--hard-wrap diag-start (point) 80)
       (agent-review-diagnostic--fontify-markdown diag-start (point))
       (insert "\n\n"))
     ;; Footer with keybinding hints
@@ -1537,9 +1536,12 @@ compute faces, then copies them to the current buffer."
       (insert (funcall hint "RET" "jump to file")
               (funcall hint "I" "investigate")
               (funcall hint "S" "fix in agent-shell")
+              "\n"
               (funcall hint "W" "copy")
               (funcall hint "n/p" "navigate")
               (funcall hint "q" "quit")))
+    ;; Hard-wrap entire buffer at column 80
+    (agent-review-diagnostic--hard-wrap (point-min) (point-max) 80)
     (goto-char (point-min))
     (setq agent-review-diagnostic--issue issue)))
 
@@ -1660,7 +1662,8 @@ diagnostic appended as context."
 (define-derived-mode agent-review-diagnostic-mode special-mode "AR-Diagnostic"
   "Major mode for displaying a full diagnostic for a review issue.
 
-\\{agent-review-diagnostic-mode-map}")
+\\{agent-review-diagnostic-mode-map}"
+  (setq truncate-lines t))
 
 (with-eval-after-load 'evil
   (evil-set-initial-state 'agent-review-diagnostic-mode 'normal)
