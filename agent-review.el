@@ -1448,7 +1448,7 @@ Uses the gh CLI."
             (string-trim (buffer-string))
           "unknown")))))
 
-(defun agent-review-clean-blind-approve ()
+(defun agent-review-clean-reviews ()
   "Remove merged or closed PRs from the blind-approve list."
   (interactive)
   (let* ((urls (agent-review--blind-approve-load))
