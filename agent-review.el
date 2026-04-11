@@ -41,6 +41,7 @@
 
 (require 'acp)
 (require 'agent-shell)
+(require 'magit-section)
 (require 'tabulated-list)
 
 (defgroup agent-review nil
@@ -186,6 +187,70 @@ baseRefName, headRefName, url, number."
             (json-read-from-string (buffer-string))
           (error "gh pr view failed (exit %d): %s"
                  exit-code (string-trim (buffer-string))))))))
+
+(defun agent-review--get-pr-review-comments (pr-url)
+  "Fetch review comments for a GitHub PR at PR-URL using the gh CLI.
+Returns a list of comment alists, each with keys: path, line, diff_hunk,
+body, user (login), created_at.  Returns nil if no comments."
+  (unless (executable-find "gh")
+    (user-error "gh CLI not found.  Install it from https://cli.github.com"))
+  (let* ((parsed (agent-review--parse-pr-url pr-url))
+         (repo (car parsed))
+         (number (cdr parsed)))
+    (with-temp-buffer
+      (let ((exit-code (call-process "gh" nil t nil
+                                     "api"
+                                     (format "/repos/%s/pulls/%s/comments" repo number)
+                                     "--paginate")))
+        (if (zerop exit-code)
+            (let ((comments (json-read-from-string (buffer-string))))
+              (when (> (length comments) 0)
+                (append comments nil)))
+          (error "gh api comments failed (exit %d): %s"
+                 exit-code (string-trim (buffer-string))))))))
+
+(defun agent-review--get-pr-thread-resolution (pr-url)
+  "Fetch review thread resolution status for PR at PR-URL via GraphQL.
+Returns a hash table mapping parent comment databaseId to resolved boolean."
+  (let* ((parsed (agent-review--parse-pr-url pr-url))
+         (repo (car parsed))
+         (number (cdr parsed))
+         (owner (car (split-string repo "/")))
+         (name (cadr (split-string repo "/")))
+         (query (format "query {
+  repository(owner: \"%s\", name: \"%s\") {
+    pullRequest(number: %s) {
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved
+          comments(first: 1) {
+            nodes { databaseId }
+          }
+        }
+      }
+    }
+  }
+}" owner name number))
+         (result (make-hash-table :test 'equal)))
+    (with-temp-buffer
+      (let ((exit-code (call-process "gh" nil t nil
+                                     "api" "graphql"
+                                     "-f" (format "query=%s" query))))
+        (when (zerop exit-code)
+          (let* ((json (json-read-from-string (buffer-string)))
+                 (threads (alist-get 'nodes
+                                     (alist-get 'reviewThreads
+                                                (alist-get 'pullRequest
+                                                           (alist-get 'repository
+                                                                      (alist-get 'data json)))))))
+            (seq-doseq (thread threads)
+              (let* ((resolved (alist-get 'isResolved thread))
+                     (comments (alist-get 'nodes (alist-get 'comments thread)))
+                     (db-id (and (> (length comments) 0)
+                                 (alist-get 'databaseId (aref comments 0)))))
+                (when db-id
+                  (puthash db-id resolved result))))))))
+    result))
 
 (defun agent-review--get-commit-range-diff (commit-range)
   "Get diff for COMMIT-RANGE (e.g. \"abc123..def456\").
@@ -1600,6 +1665,53 @@ Uses the gh CLI."
     (message "Removed %d PR%s (%d remaining)"
              removed (if (= removed 1) "" "s") (length remaining))))
 
+;;; PR Comment Last-Seen Tracking
+
+(defun agent-review--last-seen-file ()
+  "Return the path to the last-seen timestamps file."
+  (let ((dir agent-review-save-directory))
+    (unless (file-directory-p dir)
+      (make-directory dir t))
+    (expand-file-name "pr-last-seen.eld" dir)))
+
+(defun agent-review--last-seen-load ()
+  "Load and return the alist of (pr-url . timestamp) last-seen entries."
+  (let ((file (agent-review--last-seen-file)))
+    (when (file-exists-p file)
+      (with-temp-buffer
+        (insert-file-contents file)
+        (read (current-buffer))))))
+
+(defun agent-review--last-seen-save (entries)
+  "Save ENTRIES alist to the last-seen file."
+  (let ((file (agent-review--last-seen-file)))
+    (with-temp-file file
+      (let ((print-level nil)
+            (print-length nil))
+        (prin1 entries (current-buffer))))))
+
+(defun agent-review--last-seen-get (pr-url)
+  "Return the last-seen ISO timestamp for PR-URL, or nil."
+  (alist-get pr-url (agent-review--last-seen-load) nil nil #'equal))
+
+(defun agent-review--last-seen-update (pr-url)
+  "Update the last-seen timestamp for PR-URL to now."
+  (let* ((entries (agent-review--last-seen-load))
+         (now (format-time-string "%Y-%m-%dT%H:%M:%SZ" nil t))
+         (existing (assoc pr-url entries #'equal)))
+    (if existing
+        (setcdr existing now)
+      (push (cons pr-url now) entries))
+    (agent-review--last-seen-save entries)))
+
+(defun agent-review--comment-is-new-p (comment last-seen)
+  "Return non-nil if COMMENT was created after LAST-SEEN timestamp.
+LAST-SEEN is an ISO 8601 string or nil (all comments are new)."
+  (or (null last-seen)
+      (let ((created (alist-get 'created_at comment)))
+        (and created (string> created last-seen)))))
+
+
 ;;; PR Overview Buffer
 
 (defvar-local agent-review-pr-overview--pr-url nil
@@ -1620,6 +1732,12 @@ Uses the gh CLI."
 (defvar-local agent-review-pr-overview--explaining nil
   "Non-nil when an explain request is in progress.")
 
+(defvar-local agent-review-pr-overview--human-comment-count nil
+  "Number of human (non-bot) review comments on this PR.")
+
+(defvar-local agent-review-pr-overview--new-comment-count nil
+  "Number of new (unseen) human review comments on this PR.")
+
 (defun agent-review-pr-overview--render ()
   "Render the PR overview into the current buffer."
   (let ((inhibit-read-only t)
@@ -1633,6 +1751,7 @@ Uses the gh CLI."
                           " " (propertize desc 'face 'shadow) "  "))))
       (insert (funcall hint "E" "explain PR")
               (funcall hint "I" "investigate")
+              (funcall hint "C" "comments")
               (funcall hint "R" "submit review")
               (funcall hint "c" "code review")
               (funcall hint "q" "quit")
@@ -1655,6 +1774,21 @@ Uses the gh CLI."
                            (append labels nil)
                            ", ")
                 "\n")))
+    ;; Human comments indicator
+    (when agent-review-pr-overview--human-comment-count
+      (let ((count agent-review-pr-overview--human-comment-count)
+            (new-count (or agent-review-pr-overview--new-comment-count 0)))
+        (if (> count 0)
+            (progn
+              (insert (propertize (format "Comments: %d human review comment%s"
+                                          count (if (= count 1) "" "s"))
+                                  'face 'warning))
+              (when (> new-count 0)
+                (insert "  "
+                        (propertize (format "(%d new)" new-count)
+                                    'face 'error)))
+              (insert "  (press " (propertize "C" 'face 'help-key-binding) " to view)\n"))
+          (insert (propertize "Comments: none" 'face 'shadow) "\n"))))
     ;; Separator
     (insert "\n" (propertize (make-string 72 ?─) 'face 'shadow) "\n\n")
     ;; PR body
@@ -1842,6 +1976,7 @@ of the full PR description and explanation."
   :parent special-mode-map
   "E" #'agent-review-pr-overview-explain
   "I" #'agent-review-pr-overview-investigate
+  "C" #'agent-review-pr-overview-view-comments
   "R" #'agent-review-pr-overview-submit-review
   "c" #'agent-review-pr-overview-code-review
   "q" #'quit-window)
@@ -1857,11 +1992,401 @@ of the full PR description and explanation."
   (evil-define-key* 'normal agent-review-pr-overview-mode-map
     "E" #'agent-review-pr-overview-explain
     "I" #'agent-review-pr-overview-investigate
+    "C" #'agent-review-pr-overview-view-comments
     "R" #'agent-review-pr-overview-submit-review
     "c" #'agent-review-pr-overview-code-review
     "q" #'quit-window)
   (evil-define-key* 'visual agent-review-pr-overview-mode-map
     "I" #'agent-review-pr-overview-investigate))
+
+
+;;; PR Comments Buffer
+
+(defvar-local agent-review-pr-comments--comments nil
+  "List of review comment alists for this buffer.")
+
+(defvar-local agent-review-pr-comments--pr-url nil
+  "PR URL associated with this comments buffer.")
+
+(defvar-local agent-review-pr-comments--resolved nil
+  "Hash table mapping parent comment id to resolved boolean.")
+
+(defvar-local agent-review-pr-comments--last-seen nil
+  "ISO timestamp of last time this PR's comments were viewed.")
+
+(defun agent-review-pr-comments--thread-comments (comments)
+  "Organize COMMENTS into threads.
+Returns a list of threads, where each thread is (parent . replies).
+Replies are comments with a non-nil `in_reply_to_id'.
+Threads are ordered by parent creation time."
+  (let ((parents '())
+        (replies (make-hash-table :test 'equal)))
+    (dolist (comment comments)
+      (let ((reply-to (alist-get 'in_reply_to_id comment)))
+        (if reply-to
+            (puthash reply-to
+                     (append (gethash reply-to replies) (list comment))
+                     replies)
+          (push comment parents))))
+    (mapcar (lambda (parent)
+              (cons parent (gethash (alist-get 'id parent) replies)))
+            (nreverse parents))))
+
+(defun agent-review-pr-comments--group-by-file (comments)
+  "Group COMMENTS by file path, with threading.
+Returns an alist of (file . threads) sorted by file name,
+where each thread is (parent . replies)."
+  (let ((threads (agent-review-pr-comments--thread-comments comments))
+        (groups (make-hash-table :test 'equal)))
+    (dolist (thread threads)
+      (let ((path (alist-get 'path (car thread))))
+        (puthash path (append (gethash path groups) (list thread)) groups)))
+    (let ((result '()))
+      (maphash (lambda (k v) (push (cons k v) result)) groups)
+      (sort result (lambda (a b) (string< (car a) (car b)))))))
+
+(defun agent-review-pr-comments--insert-diff-hunk (diff-hunk)
+  "Insert DIFF-HUNK text with per-line diff faces."
+  (dolist (line (split-string diff-hunk "\n" t))
+    (cond
+     ((string-prefix-p "@@" line)
+      (insert (propertize line 'font-lock-face 'magit-diff-hunk-heading) "\n"))
+     ((string-prefix-p "+" line)
+      (insert (propertize line 'font-lock-face 'magit-diff-added) "\n"))
+     ((string-prefix-p "-" line)
+      (insert (propertize line 'font-lock-face 'magit-diff-removed) "\n"))
+     (t
+      (insert (propertize line 'font-lock-face 'magit-diff-context) "\n")))))
+
+(defun agent-review-pr-comments--fontify-markdown-string (text)
+  "Return TEXT with markdown font-lock faces applied.
+Unlike `agent-review-diagnostic--fontify-markdown', this does not
+modify the current buffer — it returns a new fontified string."
+  (if (fboundp 'markdown-mode)
+      (with-temp-buffer
+        (insert text)
+        (delay-mode-hooks (markdown-mode))
+        (font-lock-ensure)
+        (buffer-string))
+    text))
+
+(defun agent-review-pr-comments--render ()
+  "Render all comments into the current buffer using magit-section."
+  (let ((inhibit-read-only t)
+        (comments agent-review-pr-comments--comments))
+    (erase-buffer)
+    (magit-insert-section (root)
+      ;; Keybinding hints
+      (let ((hint (lambda (key desc)
+                    (concat (propertize key 'face 'help-key-binding)
+                            " " (propertize desc 'face 'shadow) "  "))))
+        (insert (funcall hint "TAB" "toggle")
+                (funcall hint "n/p" "navigate")
+                (funcall hint "r" "reply")
+                (funcall hint "RET" "browse")
+                (funcall hint "I" "investigate")
+                (funcall hint "q" "quit")
+                "\n\n"))
+      ;; Group comments by file (threaded)
+      (let ((grouped (agent-review-pr-comments--group-by-file comments)))
+        (dolist (group grouped)
+          (let ((file (car group))
+                (threads (cdr group)))
+            (magit-insert-section (file file)
+              (magit-insert-heading
+                (propertize file 'font-lock-face 'magit-diff-file-heading)
+                (propertize (format "  (%d)" (length threads))
+                            'font-lock-face 'magit-section-child-count))
+              ;; Each thread: parent comment + replies
+              (dolist (thread threads)
+                (let* ((parent (car thread))
+                       (replies (cdr thread))
+                       (diff-hunk (alist-get 'diff_hunk parent))
+                       (body (alist-get 'body parent))
+                       (user (alist-get 'login (alist-get 'user parent)))
+                       (created (alist-get 'created_at parent))
+                       (date (if (and created (>= (length created) 10))
+                                 (substring created 0 10)
+                               created))
+                       (comment-id (alist-get 'id parent))
+                       (resolved (and agent-review-pr-comments--resolved
+                                      (gethash comment-id
+                                               agent-review-pr-comments--resolved)))
+                       (is-new (agent-review--comment-is-new-p
+                                parent agent-review-pr-comments--last-seen))
+                       (status-tag (if resolved
+                                       (propertize " [resolved]" 'font-lock-face 'success)
+                                     (propertize " [open]" 'font-lock-face 'warning)))
+                       (new-tag (when is-new
+                                  (propertize " [NEW]" 'font-lock-face 'error))))
+                  (magit-insert-section (comment parent)
+                    (magit-insert-heading
+                      (propertize (format "@%s" (or user "unknown"))
+                                  'font-lock-face 'magit-log-author)
+                      (propertize (format "  %s" (or date ""))
+                                  'font-lock-face 'magit-log-date)
+                      status-tag
+                      (or new-tag ""))
+                    ;; Diff hunk (only for parent)
+                    (when diff-hunk
+                      (agent-review-pr-comments--insert-diff-hunk diff-hunk)
+                      (insert "\n"))
+                    ;; Parent comment body
+                    (insert (agent-review-pr-comments--fontify-markdown-string
+                             (or body ""))
+                            "\n")
+                    ;; Replies (no diff hunk, indented)
+                    (dolist (reply replies)
+                      (let* ((r-body (alist-get 'body reply))
+                             (r-user (alist-get 'login (alist-get 'user reply)))
+                             (r-created (alist-get 'created_at reply))
+                             (r-date (if (and r-created (>= (length r-created) 10))
+                                         (substring r-created 0 10)
+                                       r-created))
+                             (r-new (agent-review--comment-is-new-p
+                                     reply agent-review-pr-comments--last-seen))
+                             (r-new-tag (when r-new
+                                          (propertize " [NEW]" 'font-lock-face 'error))))
+                        (magit-insert-section (reply reply)
+                          (magit-insert-heading
+                            (propertize "  ↳ " 'font-lock-face 'shadow)
+                            (propertize (format "@%s" (or r-user "unknown"))
+                                        'font-lock-face 'magit-log-author)
+                            (propertize (format "  %s" (or r-date ""))
+                                        'font-lock-face 'magit-log-date)
+                            (or r-new-tag ""))
+                          (insert "  "
+                                  (agent-review-pr-comments--fontify-markdown-string
+                                   (or r-body ""))
+                                  "\n"))))
+                    (insert "\n")))))))))
+    (goto-char (point-min))))
+
+(defun agent-review-pr-comments-browse ()
+  "Open the comment at point in the browser."
+  (interactive)
+  (when-let* ((section (magit-current-section))
+              (value (oref section value))
+              (url (alist-get 'html_url value)))
+    (browse-url url)))
+
+;;; Comment Reply
+
+(defun agent-review--gh-post-comment-reply (pr-url in-reply-to-id body)
+  "Post a reply to a review comment on PR-URL.
+IN-REPLY-TO-ID is the comment ID to reply to.  BODY is the reply text.
+Returns the URL of the created comment."
+  (unless (executable-find "gh")
+    (user-error "gh CLI not found.  Install it from https://cli.github.com"))
+  (let* ((parsed (agent-review--parse-pr-url pr-url))
+         (repo (car parsed))
+         (number (cdr parsed))
+         (payload (json-encode `((body . ,body)
+                                 (in_reply_to . ,in-reply-to-id))))
+         (temp-file (make-temp-file "agent-review-reply-" nil ".json")))
+    (unwind-protect
+        (progn
+          (with-temp-file temp-file
+            (insert payload))
+          (with-temp-buffer
+            (let ((exit-code (call-process "gh" nil t nil
+                                           "api"
+                                           "--method" "POST"
+                                           "-H" "Accept: application/vnd.github+json"
+                                           "-H" "X-GitHub-Api-Version: 2022-11-28"
+                                           (format "/repos/%s/pulls/%s/comments" repo number)
+                                           "--input" temp-file)))
+              (if (zerop exit-code)
+                  (let ((result (json-read-from-string (buffer-string))))
+                    (alist-get 'html_url result))
+                (error "Failed to post reply (exit %d): %s"
+                       exit-code (string-trim (buffer-string)))))))
+      (delete-file temp-file))))
+
+(defvar-local agent-review--reply-pr-url nil
+  "PR URL for the reply being composed.")
+
+(defvar-local agent-review--reply-comment-id nil
+  "Comment ID being replied to.")
+
+(defvar-local agent-review--reply-comments-buffer nil
+  "The comments buffer that initiated the reply.")
+
+(defvar agent-review-reply-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-c") #'agent-review-reply-confirm)
+    (define-key map (kbd "C-c C-k") #'agent-review-reply-abort)
+    map)
+  "Keymap for `agent-review-reply-mode'.")
+
+(define-derived-mode agent-review-reply-mode text-mode "AR-Reply"
+  "Mode for composing a reply to a PR review comment.
+
+\\<agent-review-reply-mode-map>\
+\\[agent-review-reply-confirm] to submit the reply.
+\\[agent-review-reply-abort] to abort.")
+
+(defun agent-review-reply-confirm ()
+  "Submit the reply and close the edit buffer."
+  (interactive)
+  (let* ((body (string-trim
+                (save-excursion
+                  (goto-char (point-min))
+                  (forward-line 3)
+                  (buffer-substring-no-properties (point) (point-max)))))
+         (pr-url agent-review--reply-pr-url)
+         (comment-id agent-review--reply-comment-id)
+         (comments-buffer agent-review--reply-comments-buffer))
+    (when (string-empty-p body)
+      (user-error "Reply body is empty"))
+    (when (y-or-n-p "Submit reply? ")
+      (let ((url (agent-review--gh-post-comment-reply pr-url comment-id body)))
+        (quit-window t)
+        (kill-new url)
+        (message "Reply posted: %s (URL copied)" url)))))
+
+(defun agent-review-reply-abort ()
+  "Abort composing the reply."
+  (interactive)
+  (when (y-or-n-p "Abort reply? ")
+    (quit-window t)
+    (message "Reply aborted")))
+
+(defun agent-review-pr-comments-reply ()
+  "Reply to the comment at point."
+  (interactive)
+  (let* ((section (magit-current-section))
+         (value (and section (oref section value)))
+         (comment-id (and value (alist-get 'id value)))
+         (user (and value (alist-get 'login (alist-get 'user value))))
+         (body-preview (and value
+                            (let ((b (or (alist-get 'body value) "")))
+                              (if (> (length b) 80)
+                                  (concat (substring b 0 80) "...")
+                                b))))
+         (pr-url agent-review-pr-comments--pr-url))
+    (unless comment-id
+      (user-error "No comment at point"))
+    ;; For replies, reply to the parent thread (find the root comment id)
+    (when (eq (oref section type) 'reply)
+      (let ((parent-value (oref (oref section parent) value)))
+        (when parent-value
+          (setq comment-id (alist-get 'id parent-value)))))
+    (let ((buffer (get-buffer-create "*AR Reply*")))
+      (with-current-buffer buffer
+        (agent-review-reply-mode)
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (propertize
+                   (format "# Replying to @%s\n# C-c C-c to submit, C-c C-k to abort\n# ── Everything below this line is the reply ──\n"
+                           (or user "unknown"))
+                   'face 'font-lock-comment-face
+                   'read-only t
+                   'front-sticky '(read-only)
+                   'rear-nonsticky '(read-only))))
+        (setq agent-review--reply-pr-url pr-url)
+        (setq agent-review--reply-comment-id comment-id)
+        (setq agent-review--reply-comments-buffer (current-buffer))
+        (goto-char (point-max))
+        (set-buffer-modified-p nil))
+      (pop-to-buffer buffer))))
+
+(defun agent-review-pr-comments-investigate ()
+  "Investigate the comment at point in agent-shell."
+  (interactive)
+  (let* ((section (magit-current-section))
+         (comment (and section
+                       (eq (oref section type) 'comment)
+                       (oref section value)))
+         (context (if comment
+                      (let ((user (alist-get 'login (alist-get 'user comment)))
+                            (path (alist-get 'path comment))
+                            (diff-hunk (or (alist-get 'diff_hunk comment) ""))
+                            (body (or (alist-get 'body comment) "")))
+                        (format "File: %s\nAuthor: @%s\n\nDiff:\n%s\n\nComment:\n%s"
+                                path user diff-hunk body))
+                    ;; Fallback: grab visible text around point
+                    (buffer-substring-no-properties
+                     (save-excursion (magit-section-backward) (point))
+                     (save-excursion (magit-section-forward) (point)))))
+         (message-text (read-string "Investigate: "))
+         (full-text (concat message-text
+                            "\n\nContext from PR comment:\n\n"
+                            context "\n")))
+    (condition-case nil
+        (progn
+          (agent-shell-insert :text full-text)
+          (message "Sent to agent-shell"))
+      (error
+       (if (y-or-n-p "No agent shell found. Start one? ")
+           (progn
+             (agent-shell-start :config (agent-shell-select-config
+                                          :prompt "Select agent: "))
+             (run-with-timer 1.0 nil
+                             (lambda (text)
+                               (condition-case err
+                                   (agent-shell-insert :text text)
+                                 (error
+                                  (message "Failed to send to agent-shell: %s"
+                                           (error-message-string err)))))
+                             full-text))
+         (message "Cancelled"))))))
+
+(defvar-keymap agent-review-pr-comments-mode-map
+  :doc "Keymap for `agent-review-pr-comments-mode'."
+  :parent magit-section-mode-map
+  "RET" #'agent-review-pr-comments-browse
+  "r" #'agent-review-pr-comments-reply
+  "I" #'agent-review-pr-comments-investigate
+  "q" #'quit-window)
+
+(define-derived-mode agent-review-pr-comments-mode magit-section-mode "AR-Comments"
+  "Major mode for displaying PR review comments with diff context.
+Uses magit-section for collapsible file and comment sections.
+
+\\{agent-review-pr-comments-mode-map}"
+  (setq truncate-lines nil))
+
+(with-eval-after-load 'evil
+  (evil-set-initial-state 'agent-review-pr-comments-mode 'normal)
+  (evil-define-key* 'normal agent-review-pr-comments-mode-map
+    (kbd "RET") #'agent-review-pr-comments-browse
+    "r" #'agent-review-pr-comments-reply
+    "I" #'agent-review-pr-comments-investigate
+    "q" #'quit-window))
+
+(defun agent-review-pr-overview-view-comments ()
+  "Fetch and display review comments for this PR."
+  (interactive)
+  (let ((pr-url agent-review-pr-overview--pr-url))
+    (message "Fetching review comments...")
+    (let* ((all-comments (agent-review--get-pr-review-comments pr-url))
+           (comments (seq-filter
+                      (lambda (c)
+                        (let ((user-type (alist-get 'type (alist-get 'user c))))
+                          (or (null user-type) (string= user-type "User"))))
+                      (or all-comments '()))))
+      (if (null comments)
+          (message "No human review comments on this PR")
+        (message "Fetching thread resolution status...")
+        (let ((resolved (agent-review--get-pr-thread-resolution pr-url))
+              (last-seen (agent-review--last-seen-get pr-url))
+              (buffer (get-buffer-create
+                       (format "*AR Comments @ %s*"
+                               (agent-review--project-name)))))
+          (with-current-buffer buffer
+            (agent-review-pr-comments-mode)
+            (setq agent-review-pr-comments--comments comments)
+            (setq agent-review-pr-comments--pr-url pr-url)
+            (setq agent-review-pr-comments--resolved resolved)
+            (setq agent-review-pr-comments--last-seen last-seen)
+            (agent-review-pr-comments--render))
+          ;; Mark comments as seen
+          (agent-review--last-seen-update pr-url)
+          (pop-to-buffer buffer)
+          (message "%d human review comment%s"
+                   (length comments)
+                   (if (= (length comments) 1) "" "s")))))))
 
 
 ;;; Diagnostic Buffer
@@ -2389,10 +2914,25 @@ With optional CONFIG, use that agent configuration."
                             :prompt "Select agent for review: ")))
          (buffer-name (format "*AR Overview @ %s*" (agent-review--project-name))))
     (message "Fetching PR metadata...")
-    (let ((metadata (agent-review--get-pr-metadata pr-url))
-          (changes (progn
-                     (message "Fetching PR diff...")
-                     (agent-review--get-pr-diff pr-url))))
+    (let* ((metadata (agent-review--get-pr-metadata pr-url))
+           (changes (progn
+                      (message "Fetching PR diff...")
+                      (agent-review--get-pr-diff pr-url)))
+           (comments (progn
+                       (message "Fetching PR comments...")
+                       (agent-review--get-pr-review-comments pr-url)))
+           (human-comments
+            (seq-filter
+             (lambda (c)
+               (let ((user-type (alist-get 'type (alist-get 'user c))))
+                 (or (null user-type) (string= user-type "User"))))
+             (or comments '())))
+           (human-count (length human-comments))
+           (last-seen (agent-review--last-seen-get pr-url))
+           (new-count (length
+                       (seq-filter
+                        (lambda (c) (agent-review--comment-is-new-p c last-seen))
+                        human-comments))))
       (let ((buffer (get-buffer-create buffer-name)))
         (with-current-buffer buffer
           (agent-review-pr-overview-mode)
@@ -2402,6 +2942,8 @@ With optional CONFIG, use that agent configuration."
           (setq agent-review-pr-overview--agent-config agent-config)
           (setq agent-review-pr-overview--explanation nil)
           (setq agent-review-pr-overview--explaining nil)
+          (setq agent-review-pr-overview--human-comment-count human-count)
+          (setq agent-review-pr-overview--new-comment-count new-count)
           (agent-review-pr-overview--render))
         (pop-to-buffer buffer)
         (message "PR overview loaded")))))
