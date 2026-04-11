@@ -168,6 +168,25 @@ Returns a changes alist with a :pr-diff key."
           (error "gh pr diff failed (exit %d): %s"
                  exit-code (string-trim (buffer-string))))))))
 
+(defun agent-review--get-pr-metadata (pr-url)
+  "Fetch metadata for a GitHub PR at PR-URL using the gh CLI.
+Returns a parsed JSON alist with keys: title, body, author, labels,
+baseRefName, headRefName, url, number."
+  (unless (executable-find "gh")
+    (user-error "gh CLI not found.  Install it from https://cli.github.com"))
+  (let* ((parsed (agent-review--parse-pr-url pr-url))
+         (repo (car parsed))
+         (number (cdr parsed)))
+    (with-temp-buffer
+      (let ((exit-code (call-process "gh" nil t nil
+                                     "pr" "view" number
+                                     "--repo" repo
+                                     "--json" "title,body,author,labels,baseRefName,headRefName,url,number")))
+        (if (zerop exit-code)
+            (json-read-from-string (buffer-string))
+          (error "gh pr view failed (exit %d): %s"
+                 exit-code (string-trim (buffer-string))))))))
+
 (defun agent-review--get-commit-range-diff (commit-range)
   "Get diff for COMMIT-RANGE (e.g. \"abc123..def456\").
 Returns a changes alist with a :commit-diff key."
@@ -624,6 +643,93 @@ first detecting the programming language, then sending the review prompt."
          (agent-review--cleanup-session work-buffer)
          (kill-buffer work-buffer)
          (funcall on-complete nil nil (format "Initialization failed: %S" err)))))))
+
+
+(defun agent-review--request-prompt-async (prompt-text config on-complete)
+  "Send PROMPT-TEXT to agent using CONFIG and call ON-COMPLETE when done.
+ON-COMPLETE is called with (response-text error) where error is nil on success.
+This is a single-turn prompt without language detection."
+  (let* ((work-buffer (generate-new-buffer " *agent-review-prompt-work*"))
+         (client nil)
+         (session-id nil))
+    (with-current-buffer work-buffer
+      (setq agent-review--session-response-text "")
+      (setq client (funcall (alist-get :client-maker config) work-buffer))
+      (setq agent-review--session-client client)
+      (acp-subscribe-to-notifications
+       :client client
+       :buffer work-buffer
+       :on-notification
+       (lambda (notification)
+         (when (buffer-live-p work-buffer)
+           (with-current-buffer work-buffer
+             (let-alist notification
+               (when (equal .method "session/update")
+                 (let ((update (alist-get 'update .params)))
+                   (when (equal (alist-get 'sessionUpdate update) "agent_message_chunk")
+                     (let-alist update
+                       (setq agent-review--session-response-text
+                             (concat agent-review--session-response-text .content.text)))))))))))
+      (acp-subscribe-to-errors
+       :client client
+       :buffer work-buffer
+       :on-error
+       (lambda (err)
+         (agent-review--cleanup-session work-buffer)
+         (kill-buffer work-buffer)
+         (funcall on-complete nil (format "Agent error: %S" err))))
+      (acp-send-request
+       :client client
+       :sync nil
+       :request (acp-make-initialize-request
+                 :protocol-version 1
+                 :read-text-file-capability nil
+                 :write-text-file-capability nil)
+       :on-success
+       (lambda (_result)
+         (when (buffer-live-p work-buffer)
+           (acp-send-request
+            :client client
+            :sync nil
+            :request (acp-make-session-new-request
+                      :cwd default-directory
+                      :mcp-servers [])
+            :on-success
+            (lambda (session-response)
+              (when (buffer-live-p work-buffer)
+                (with-current-buffer work-buffer
+                  (setq session-id (alist-get 'sessionId session-response))
+                  (setq agent-review--session-id session-id)
+                  (acp-send-request
+                   :client client
+                   :sync nil
+                   :request (acp-make-session-prompt-request
+                             :session-id session-id
+                             :prompt (vector (list (cons 'type "text")
+                                                   (cons 'text prompt-text))))
+                   :on-success
+                   (lambda (_result)
+                     (when (buffer-live-p work-buffer)
+                       (let ((response (with-current-buffer work-buffer
+                                         agent-review--session-response-text)))
+                         (agent-review--cleanup-session work-buffer)
+                         (kill-buffer work-buffer)
+                         (funcall on-complete response nil))))
+                   :on-failure
+                   (lambda (err)
+                     (agent-review--cleanup-session work-buffer)
+                     (kill-buffer work-buffer)
+                     (funcall on-complete nil (format "Prompt failed: %S" err)))))))
+            :on-failure
+            (lambda (err)
+              (agent-review--cleanup-session work-buffer)
+              (kill-buffer work-buffer)
+              (funcall on-complete nil (format "Session creation failed: %S" err))))))
+       :on-failure
+       (lambda (err)
+         (agent-review--cleanup-session work-buffer)
+         (kill-buffer work-buffer)
+         (funcall on-complete nil (format "Initialization failed: %S" err)))))))
 
 
 ;;; Response Parser
@@ -1401,6 +1507,24 @@ Uses the gh CLI to post comments on the pull request."
     (unless (member pr-url urls)
       (agent-review--blind-approve-save (append urls (list pr-url))))))
 
+(defun agent-review--pr-title-for-url (pr-url)
+  "Fetch the PR title for PR-URL using the gh CLI.
+Returns the title string, or the URL itself on failure."
+  (condition-case nil
+      (let* ((parsed (agent-review--parse-pr-url pr-url))
+             (repo (car parsed))
+             (number (cdr parsed)))
+        (with-temp-buffer
+          (let ((exit-code (call-process "gh" nil t nil
+                                         "pr" "view" number
+                                         "--repo" repo
+                                         "--json" "title"
+                                         "--jq" ".title")))
+            (if (zerop exit-code)
+                (string-trim (buffer-string))
+              pr-url))))
+    (error pr-url)))
+
 (defun agent-review-re-approve ()
   "Re-approve a previously reviewed PR.
 Prompts to select from PRs that were previously approved via
@@ -1409,10 +1533,19 @@ agent-review, then sends an APPROVE review to GitHub."
   (let ((urls (agent-review--blind-approve-load)))
     (unless urls
       (user-error "No previously approved PRs recorded"))
-    (let* ((choice (completing-read "Re-approve PR: " urls nil t)))
-      (agent-review--parse-pr-url choice) ; validate URL
+    (message "Fetching PR titles...")
+    (let* ((entries (mapcar (lambda (url)
+                              (let ((title (agent-review--pr-title-for-url url)))
+                                (cons (format "%s  (%s)" title
+                                              (replace-regexp-in-string
+                                               "^https://github\\.com/" "" url))
+                                url)))
+                            urls))
+           (choice (completing-read "Re-approve PR: " entries nil t))
+           (pr-url (cdr (assoc choice entries))))
+      (agent-review--parse-pr-url pr-url)
       (let ((url (agent-review--gh-submit-pr-review
-                  :pr-url choice
+                  :pr-url pr-url
                   :event "APPROVE"
                   :body "LGTM\n\n---\n*Generated by agent-review.el*")))
         (kill-new url)
@@ -1466,6 +1599,270 @@ Uses the gh CLI."
     (agent-review--blind-approve-save (nreverse remaining))
     (message "Removed %d PR%s (%d remaining)"
              removed (if (= removed 1) "" "s") (length remaining))))
+
+;;; PR Overview Buffer
+
+(defvar-local agent-review-pr-overview--pr-url nil
+  "GitHub PR URL for this overview buffer.")
+
+(defvar-local agent-review-pr-overview--metadata nil
+  "Parsed PR metadata alist for this overview buffer.")
+
+(defvar-local agent-review-pr-overview--diff nil
+  "Cached PR diff (changes alist) for code review.")
+
+(defvar-local agent-review-pr-overview--explanation nil
+  "Agent explanation text, nil until requested.")
+
+(defvar-local agent-review-pr-overview--agent-config nil
+  "Agent configuration for this overview buffer.")
+
+(defvar-local agent-review-pr-overview--explaining nil
+  "Non-nil when an explain request is in progress.")
+
+(defun agent-review-pr-overview--render ()
+  "Render the PR overview into the current buffer."
+  (let ((inhibit-read-only t)
+        (metadata agent-review-pr-overview--metadata)
+        (explanation agent-review-pr-overview--explanation)
+        (explaining agent-review-pr-overview--explaining))
+    (erase-buffer)
+    ;; Keybinding hints
+    (let ((hint (lambda (key desc)
+                  (concat (propertize key 'face 'help-key-binding)
+                          " " (propertize desc 'face 'shadow) "  "))))
+      (insert (funcall hint "E" "explain PR")
+              (funcall hint "I" "investigate")
+              (funcall hint "R" "submit review")
+              (funcall hint "c" "code review")
+              (funcall hint "q" "quit")
+              "\n\n"))
+    ;; Title
+    (let ((title (alist-get 'title metadata)))
+      (insert (propertize title 'face '(:weight bold :height 1.3)) "\n\n"))
+    ;; Author and branch info
+    (let* ((author (alist-get 'login (alist-get 'author metadata)))
+           (base (alist-get 'baseRefName metadata))
+           (head (alist-get 'headRefName metadata)))
+      (insert (propertize "Author: " 'face 'bold) (or author "unknown") "  "
+              (propertize "Branch: " 'face 'bold) (or head "?")
+              " → " (or base "?") "\n"))
+    ;; Labels
+    (let ((labels (alist-get 'labels metadata)))
+      (when (and labels (> (length labels) 0))
+        (insert (propertize "Labels: " 'face 'bold)
+                (mapconcat (lambda (l) (alist-get 'name l))
+                           (append labels nil)
+                           ", ")
+                "\n")))
+    ;; Separator
+    (insert "\n" (propertize (make-string 72 ?─) 'face 'shadow) "\n\n")
+    ;; PR body
+    (let ((body (alist-get 'body metadata))
+          (body-start (point)))
+      (if (and body (not (string-empty-p (string-trim body))))
+          (progn
+            (insert body)
+            (agent-review-diagnostic--fontify-markdown body-start (point)))
+        (insert (propertize "(no description)" 'face 'shadow))))
+    ;; Explanation section
+    (when (or explanation explaining)
+      (insert "\n\n" (propertize (make-string 72 ?═) 'face 'shadow) "\n")
+      (insert (propertize "PR Explanation" 'face '(:weight bold :height 1.1)) "\n\n")
+      (if explaining
+          (insert (propertize "Explaining PR..." 'face 'shadow))
+        (let ((expl-start (point)))
+          (insert explanation)
+          (agent-review-diagnostic--fontify-markdown expl-start (point)))))
+    (goto-char (point-min))))
+
+(defun agent-review-pr-overview-explain ()
+  "Ask an agent to explain the PR: What, Why, Pros, Cons."
+  (interactive)
+  (when agent-review-pr-overview--explaining
+    (user-error "Explanation already in progress"))
+  (when agent-review-pr-overview--explanation
+    (unless (y-or-n-p "Re-explain PR? ")
+      (user-error "Cancelled")))
+  (let* ((metadata agent-review-pr-overview--metadata)
+         (config agent-review-pr-overview--agent-config)
+         (diff agent-review-pr-overview--diff)
+         (title (alist-get 'title metadata))
+         (body (or (alist-get 'body metadata) ""))
+         (diff-text (or (alist-get :pr-diff diff) ""))
+         (overview-buffer (current-buffer))
+         (prompt (format "You are reviewing a Pull Request.
+
+## PR Title
+%s
+
+## PR Description
+%s
+
+## PR Diff
+%s
+
+---
+
+Explain this Pull Request concisely. Structure your response as:
+
+**What has been implemented:** Describe the changes made.
+
+**Why:** Explain the motivation and context.
+
+**Pros:** List the benefits of this approach.
+
+**Cons:** List any downsides, risks, or concerns."
+                         title body diff-text)))
+    (setq agent-review-pr-overview--explaining t)
+    (setq agent-review-pr-overview--explanation nil)
+    (agent-review-pr-overview--render)
+    (message "Requesting PR explanation from %s..."
+             (or (alist-get :mode-line-name config) "agent"))
+    (agent-review--request-prompt-async
+     prompt config
+     (lambda (response error-msg)
+       (when (buffer-live-p overview-buffer)
+         (with-current-buffer overview-buffer
+           (setq agent-review-pr-overview--explaining nil)
+           (if error-msg
+               (progn
+                 (message "Explanation failed: %s" error-msg)
+                 (agent-review-pr-overview--render))
+             (setq agent-review-pr-overview--explanation (concat response "\n\n"))
+             (agent-review-pr-overview--render)
+             (message "PR explanation complete"))))))))
+
+(defun agent-review-pr-overview-investigate ()
+  "Ask a question about the PR in agent-shell.
+When a region is active, use the selected text as context instead
+of the full PR description and explanation."
+  (interactive)
+  (let* ((selection (when (use-region-p)
+                      (buffer-substring-no-properties (region-beginning) (region-end))))
+         (message-text (read-string "Investigate: "))
+         (context (if selection
+                      selection
+                    (let* ((metadata agent-review-pr-overview--metadata)
+                           (title (alist-get 'title metadata))
+                           (body (or (alist-get 'body metadata) ""))
+                           (explanation (or agent-review-pr-overview--explanation "")))
+                      (concat "PR: " title "\n\n"
+                              (unless (string-empty-p body)
+                                (concat "Description:\n" body "\n\n"))
+                              (unless (string-empty-p explanation)
+                                (concat "Agent Explanation:\n" explanation "\n"))))))
+         (full-text (concat message-text
+                            "\n\nContext from PR overview:\n\n"
+                            context "\n")))
+    (condition-case nil
+        (progn
+          (agent-shell-insert :text full-text)
+          (message "Sent to agent-shell"))
+      (error
+       (if (y-or-n-p "No agent shell found. Start one? ")
+           (progn
+             (agent-shell-start :config (agent-shell-select-config
+                                          :prompt "Select agent: "))
+             (run-with-timer 1.0 nil
+                             (lambda (text)
+                               (condition-case err
+                                   (agent-shell-insert :text text)
+                                 (error
+                                  (message "Failed to send to agent-shell: %s"
+                                           (error-message-string err)))))
+                             full-text))
+         (message "Cancelled"))))))
+
+(defun agent-review-pr-overview-submit-review ()
+  "Submit a review for this PR (no line comments, body only)."
+  (interactive)
+  (let* ((pr-url agent-review-pr-overview--pr-url)
+         (event (completing-read "Review event: "
+                                 '("COMMENT" "REQUEST_CHANGES" "APPROVE")
+                                 nil t nil nil "COMMENT")))
+    (agent-review--edit-show-body nil pr-url event 'review (current-buffer))))
+
+(defun agent-review-pr-overview-code-review ()
+  "Start a full code review of this PR."
+  (interactive)
+  (let* ((changes agent-review-pr-overview--diff)
+         (config agent-review-pr-overview--agent-config)
+         (pr-url agent-review-pr-overview--pr-url)
+         (review-buffer-name (agent-review--buffer-name))
+         (diagnostic-buffer-name (agent-review--diagnostic-buffer-name))
+         (status-buffer
+          (agent-review--show-status-buffer
+           review-buffer-name
+           (or (alist-get :mode-line-name config)
+               (alist-get :buffer-name config)
+               "agent"))))
+    (agent-review--start-progress status-buffer)
+    (message "Requesting code review from %s..."
+             (or (alist-get :mode-line-name config) "agent"))
+    (agent-review--request-review-async
+     changes config status-buffer
+     (lambda (response detected-language error-msg)
+       (agent-review--stop-progress status-buffer)
+       (if error-msg
+           (progn
+             (message "Review failed: %s" error-msg)
+             (when (buffer-live-p status-buffer)
+               (with-current-buffer status-buffer
+                 (let ((inhibit-read-only t))
+                   (setq tabulated-list-format [("Status" 0 nil)])
+                   (tabulated-list-init-header)
+                   (setq tabulated-list-entries
+                         (list (list 'status (vector (format "Review failed: %s" error-msg)))))
+                   (tabulated-list-print t)
+                   (setq agent-review--agent-config config)
+                   (goto-char (point-min))))))
+         (message "Detected language: %s" detected-language)
+         (let ((issues (agent-review--parse-issues response)))
+           (if issues
+               (progn
+                 (agent-review--display-issues issues config
+                                               review-buffer-name diagnostic-buffer-name)
+                 (with-current-buffer (get-buffer review-buffer-name)
+                   (setq agent-review--pr-url pr-url)))
+             (message "No issues found in review")
+             (when (buffer-live-p status-buffer)
+               (with-current-buffer status-buffer
+                 (let ((inhibit-read-only t))
+                   (setq tabulated-list-format [("Status" 0 nil)])
+                   (tabulated-list-init-header)
+                   (setq tabulated-list-entries
+                         (list (list 'status (vector "Review complete: No issues found"))))
+                   (tabulated-list-print t)
+                   (setq agent-review--agent-config config)
+                   (goto-char (point-min))))))))))))
+
+(defvar-keymap agent-review-pr-overview-mode-map
+  :doc "Keymap for `agent-review-pr-overview-mode'."
+  :parent special-mode-map
+  "E" #'agent-review-pr-overview-explain
+  "I" #'agent-review-pr-overview-investigate
+  "R" #'agent-review-pr-overview-submit-review
+  "c" #'agent-review-pr-overview-code-review
+  "q" #'quit-window)
+
+(define-derived-mode agent-review-pr-overview-mode special-mode "AR-Overview"
+  "Major mode for displaying a PR overview before code review.
+
+\\{agent-review-pr-overview-mode-map}"
+  (setq truncate-lines nil))
+
+(with-eval-after-load 'evil
+  (evil-set-initial-state 'agent-review-pr-overview-mode 'normal)
+  (evil-define-key* 'normal agent-review-pr-overview-mode-map
+    "E" #'agent-review-pr-overview-explain
+    "I" #'agent-review-pr-overview-investigate
+    "R" #'agent-review-pr-overview-submit-review
+    "c" #'agent-review-pr-overview-code-review
+    "q" #'quit-window)
+  (evil-define-key* 'visual agent-review-pr-overview-mode-map
+    "I" #'agent-review-pr-overview-investigate))
+
 
 ;;; Diagnostic Buffer
 
@@ -1978,9 +2375,9 @@ allowing Emacs to remain responsive during the review."
 
 ;;;###autoload
 (defun agent-review-pr (pr-url &optional config)
-  "Review a GitHub Pull Request at PR-URL using an AI agent.
-Fetches the PR diff via `gh` CLI and sends it for review.
-Requires the PR branch to be checked out locally for full file context.
+  "Open a PR overview for the GitHub Pull Request at PR-URL.
+Fetches PR metadata and diff, displays an overview buffer with
+commands to explain, investigate, submit review, or start code review.
 With optional CONFIG, use that agent configuration."
   (interactive "sGitHub PR URL: ")
   (unless (condition-case nil
@@ -1990,66 +2387,24 @@ With optional CONFIG, use that agent configuration."
   (let* ((agent-config (or config
                            (agent-shell-select-config
                             :prompt "Select agent for review: ")))
-         (review-buffer-name (agent-review--buffer-name))
-         (diagnostic-buffer-name (agent-review--diagnostic-buffer-name))
-         (changes (progn
-                    (message "Fetching PR diff...")
-                    (agent-review--get-pr-diff pr-url)))
-         (status-buffer
-          (agent-review--show-status-buffer
-           review-buffer-name
-           (or (alist-get :mode-line-name agent-config)
-               (alist-get :buffer-name agent-config)
-               "agent"))))
-
-    ;; Start progress feedback
-    (agent-review--start-progress status-buffer)
-
-    ;; Request review asynchronously
-    (message "Requesting PR review from %s..."
-             (or (alist-get :mode-line-name agent-config)
-                 (alist-get :buffer-name agent-config)
-                 "agent"))
-
-    (agent-review--request-review-async
-     changes
-     agent-config
-     status-buffer
-     (lambda (response detected-language error-msg)
-       (agent-review--stop-progress status-buffer)
-       (if error-msg
-           (progn
-             (message "Review failed: %s" error-msg)
-             (when (buffer-live-p status-buffer)
-               (with-current-buffer status-buffer
-                 (let ((inhibit-read-only t))
-                   (setq tabulated-list-format [("Status" 0 nil)])
-                   (tabulated-list-init-header)
-                   (setq tabulated-list-entries
-                         (list (list 'status (vector (format "Review failed: %s" error-msg)))))
-                   (tabulated-list-print t)
-                   (setq agent-review--agent-config agent-config)
-                   (goto-char (point-min))))))
-         (message "Detected language: %s" detected-language)
-         (let ((issues (agent-review--parse-issues response)))
-           (if issues
-               (progn
-                 (agent-review--display-issues issues agent-config
-                                               review-buffer-name diagnostic-buffer-name)
-                 (with-current-buffer (get-buffer review-buffer-name)
-                   (setq agent-review--pr-url pr-url)))
-             (message "No issues found in review")
-             (when (buffer-live-p status-buffer)
-               (with-current-buffer status-buffer
-                 (let ((inhibit-read-only t))
-                   (setq tabulated-list-format [("Status" 0 nil)])
-                   (tabulated-list-init-header)
-                   (setq tabulated-list-entries
-                         (list (list 'status (vector "Review complete: No issues found"))))
-                   (tabulated-list-print t)
-                   (setq agent-review--agent-config agent-config)
-                   (goto-char (point-min))))))))))))
-
+         (buffer-name (format "*AR Overview @ %s*" (agent-review--project-name))))
+    (message "Fetching PR metadata...")
+    (let ((metadata (agent-review--get-pr-metadata pr-url))
+          (changes (progn
+                     (message "Fetching PR diff...")
+                     (agent-review--get-pr-diff pr-url))))
+      (let ((buffer (get-buffer-create buffer-name)))
+        (with-current-buffer buffer
+          (agent-review-pr-overview-mode)
+          (setq agent-review-pr-overview--pr-url pr-url)
+          (setq agent-review-pr-overview--metadata metadata)
+          (setq agent-review-pr-overview--diff changes)
+          (setq agent-review-pr-overview--agent-config agent-config)
+          (setq agent-review-pr-overview--explanation nil)
+          (setq agent-review-pr-overview--explaining nil)
+          (agent-review-pr-overview--render))
+        (pop-to-buffer buffer)
+        (message "PR overview loaded")))))
 ;;; Magit Integration
 
 (declare-function magit-region-values "magit-section" (&rest types))
