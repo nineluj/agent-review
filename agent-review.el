@@ -69,6 +69,14 @@ built-in prompts shipped with the package."
                  (directory :tag "Custom prompts directory"))
   :group 'agent-review)
 
+(defcustom agent-review-enable-codebase-diagnostics t
+  "When non-nil, gather git codebase diagnostics before review.
+This runs git log commands to identify churn hotspots, bug clusters,
+contributor patterns, development velocity, and crisis response history.
+The results are included in the review prompt as additional context."
+  :type 'boolean
+  :group 'agent-review)
+
 (defun agent-review--project-name ()
   "Return the current project name.
 Uses projectile, project.el, or falls back to the directory name."
@@ -261,6 +269,89 @@ Returns a changes alist with a :commit-diff key."
       (user-error "No diff for commit range: %s" commit-range))
     (list (cons :commit-diff diff))))
 
+;;; Codebase Diagnostics
+
+(defun agent-review--run-git-diagnostic (command)
+  "Run a shell COMMAND for diagnostics, return trimmed output or nil.
+Best-effort: returns nil on any failure."
+  (condition-case nil
+      (let ((output (string-trim
+                     (shell-command-to-string command))))
+        (unless (string-empty-p output)
+          output))
+    (error nil)))
+
+(defun agent-review--git-churn-hotspots ()
+  "Return the 20 most-changed files in the past year."
+  (agent-review--run-git-diagnostic
+   (format "%s log --format=format: --name-only --since='1 year ago' | sort | uniq -c | sort -nr | head -20"
+           agent-review-git-executable)))
+
+(defun agent-review--git-contributor-analysis ()
+  "Return contributors ranked by commit count in the past 6 months."
+  (agent-review--run-git-diagnostic
+   (format "%s shortlog -sn --no-merges --since='6 months ago'"
+           agent-review-git-executable)))
+
+(defun agent-review--git-bug-clustering ()
+  "Return the 20 files with the most bug-fix related commits."
+  (agent-review--run-git-diagnostic
+   (format "%s log -i -E --grep='fix|bug|broken' --name-only --format='' | sort | uniq -c | sort -nr | head -20"
+           agent-review-git-executable)))
+
+(defun agent-review--git-development-velocity ()
+  "Return monthly commit frequency."
+  (agent-review--run-git-diagnostic
+   (format "%s log --format='%%ad' --date=format:'%%Y-%%m' | sort | uniq -c"
+           agent-review-git-executable)))
+
+(defun agent-review--git-crisis-patterns ()
+  "Return revert/hotfix/emergency/rollback commits from the past year."
+  (agent-review--run-git-diagnostic
+   (format "%s log --oneline --since='1 year ago' | grep -iE 'revert|hotfix|emergency|rollback'"
+           agent-review-git-executable)))
+
+(defun agent-review--gather-codebase-diagnostics ()
+  "Gather all codebase diagnostics, return formatted string or nil.
+Only runs when `agent-review-enable-codebase-diagnostics' is non-nil
+and we are in a git repository."
+  (when (and agent-review-enable-codebase-diagnostics
+             (zerop (call-process agent-review-git-executable
+                                  nil nil nil "rev-parse" "--git-dir")))
+    (let ((sections
+           (list
+            (cons "Churn Hotspots (most-changed files, past year)"
+                  (agent-review--git-churn-hotspots))
+            (cons "Recent Contributors (past 6 months)"
+                  (agent-review--git-contributor-analysis))
+            (cons "Bug Clusters (files with frequent bug-fix commits)"
+                  (agent-review--git-bug-clustering))
+            (cons "Development Velocity (monthly commit frequency)"
+                  (agent-review--git-development-velocity))
+            (cons "Crisis Response Patterns (reverts/hotfixes, past year)"
+                  (agent-review--git-crisis-patterns))))
+          (parts '()))
+      (dolist (section sections)
+        (when (cdr section)
+          (push (format "--- %s ---\n%s\n" (car section) (cdr section))
+                parts)))
+      (when parts
+        (concat
+         "=== Codebase Diagnostics ===\n\n"
+         "Use the following historical git data as context for your review.\n"
+         "Files appearing in both the churn hotspots and bug clusters deserve extra scrutiny.\n\n"
+         (mapconcat #'identity (nreverse parts) "\n"))))))
+
+(defun agent-review--attach-diagnostics (changes)
+  "Attach codebase diagnostics to CHANGES alist if enabled.
+Returns CHANGES with a :diagnostics key added, or unchanged if
+diagnostics are disabled or unavailable."
+  (if-let ((diag (agent-review--gather-codebase-diagnostics)))
+      (progn
+        (message "Gathered codebase diagnostics.")
+        (cons (cons :diagnostics diag) changes))
+    changes))
+
 ;;; Agent Integration
 
 (defun agent-review--changed-files (diff-text)
@@ -313,6 +404,9 @@ Returns a string with each file preceded by a header and numbered lines."
 (defun agent-review--format-changes-for-prompt (changes)
   "Format CHANGES alist into text for agent prompt."
   (let ((parts '()))
+    (when-let ((diagnostics (alist-get :diagnostics changes)))
+      (push diagnostics parts)
+      (push "\n\n" parts))
     (when-let ((pr-diff (alist-get :pr-diff changes)))
       (push "=== Pull Request Diff ===\n\n" parts)
       (push pr-diff parts)
@@ -365,9 +459,12 @@ file exists."
    (agent-review--load-language-prompt detected-language)
    "\n\n"
    "Review the following git changes and identify issues.\n\n"
-   "You are given two things:\n"
+   "You are given:\n"
    "1. Git diffs showing what changed\n"
-   "2. Full file contents with line numbers (each line prefixed with its number, e.g. \"  42: code here\")\n\n"
+   "2. Full file contents with line numbers (each line prefixed with its number, e.g. \"  42: code here\")\n"
+   (if (alist-get :diagnostics changes)
+       "3. Codebase diagnostics — historical git data showing churn hotspots, bug clusters, contributors, velocity, and crisis patterns. Use this to calibrate scrutiny: files that appear in both churn and bug lists warrant closer inspection.\n\n"
+     "\n")
    "LINE NUMBER INSTRUCTIONS:\n"
    "Use the line numbers from the \"Full File Contents\" section to determine the correct line.\n"
    "Find the relevant code in the numbered file listing and report that line number.\n"
@@ -2845,7 +2942,8 @@ allowing Emacs to remain responsive during the review."
          (diagnostic-buffer-name (agent-review--diagnostic-buffer-name))
          (changes (progn
                     (message "Collecting git changes...")
-                    (agent-review--get-git-changes)))
+                    (agent-review--attach-diagnostics
+                     (agent-review--get-git-changes))))
          (status-buffer
           (agent-review--show-status-buffer
            review-buffer-name
@@ -2917,7 +3015,8 @@ With optional CONFIG, use that agent configuration."
     (let* ((metadata (agent-review--get-pr-metadata pr-url))
            (changes (progn
                       (message "Fetching PR diff...")
-                      (agent-review--get-pr-diff pr-url)))
+                      (agent-review--attach-diagnostics
+                       (agent-review--get-pr-diff pr-url))))
            (comments (progn
                        (message "Fetching PR comments...")
                        (agent-review--get-pr-review-comments pr-url)))
@@ -2985,7 +3084,8 @@ With optional CONFIG, use that agent configuration."
          (diagnostic-buffer-name (agent-review--diagnostic-buffer-name))
          (changes (progn
                     (message "Fetching diff for %s..." commit-range)
-                    (agent-review--get-commit-range-diff commit-range)))
+                    (agent-review--attach-diagnostics
+                     (agent-review--get-commit-range-diff commit-range))))
          (status-buffer
           (agent-review--show-status-buffer
            review-buffer-name
