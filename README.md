@@ -73,6 +73,13 @@ Clone this repository and add to your load path:
 | U     | Unmark all issues                     |
 | W     | Copy marked issues to kill ring       |
 | S     | Send marked issues to agent-shell     |
+| e     | Show full diagnostic for issue        |
+| l     | List all review buffers               |
+| d     | Dismiss marked issues                 |
+| s     | Save review to disk                   |
+| P     | Review a GitHub PR by URL             |
+| C     | Review a commit range                 |
+| I     | Create GitHub issue from marked items |
 
 ### Programmatic Usage
 
@@ -136,6 +143,83 @@ Install git or configure `agent-review-git-executable`.
 ### No issues found but changes exist
 
 The agent may not have found any issues, or the response parsing failed. Check the agent's actual response format.
+
+## Fork Changes
+
+This fork adds the following features on top of the upstream `nineluj/agent-review`:
+
+### Custom language prompts
+- Set `agent-review-language-prompts-directory` to load your own prompt files before built-in ones
+- Lookup order: custom dir (language-specific, then `other.md`) -> built-in `languages/` dir
+- Keep personal review directives out of the repo (e.g. `~/.doom.d/directives/`)
+
+### Language-aware reviews
+- Automatic programming language detection (Python, Clojure, TypeScript, or generic)
+- Language-specific review prompts loaded from `languages/*.md` files
+- Two-turn review: first detects language, then sends a tailored review prompt
+
+### Rich diagnostics
+- Issues now have both a **short description** (shown in the list) and a full **diagnostic** explanation
+- New diagnostic buffer (`e` key) renders the full diagnostic in a bottom side window with markdown formatting, hard-wrapped at 80 columns
+- Navigate between diagnostics with `n`/`p`, jump to file with `RET`, investigate with `I`
+
+### Full file context
+- Sends full file contents with line numbers alongside diffs, so the agent can report accurate line numbers instead of defaulting to 1
+
+### Animated progress feedback
+- Spinner animation with elapsed time while the review is in progress
+- Per-buffer progress state so concurrent reviews each have independent timers
+
+### Project-scoped buffers
+- Review buffers are named per-project: `*Agent Review @ project-name*`
+- Diagnostic buffers are similarly scoped: `*Agent Review Diagnostic @ project-name*`
+- Supports projectile, project.el, and falls back to directory name
+
+### Concurrent review safety
+- All session state (status buffer, progress timer, buffer names) is captured in closures and buffer-local variables instead of globals
+- Running two reviews in different projects no longer overwrites each other's buffers
+
+### Agent-shell session guard
+- `agent-review` requires an existing `agent-shell` session for the project
+- Clear error message if no session exists: "Start one first with M-x agent-shell"
+
+### Review list manager
+- `M-x agent-review-list-reviews` (or `l` in review buffer) opens a bottom side window listing all review buffers with their status
+- Click or `RET` to jump to a review; `g` to refresh the list
+- Mouse support with highlight on hover
+
+### Evil mode support
+- Full evil normal-state keybindings for review, diagnostic, and list modes
+- `gr` for refresh (avoids shadowing `gg`/`G`)
+
+### PR review by URL
+- `M-x agent-review-pr` (or `SPC q p`) reviews a GitHub Pull Request by URL
+- Fetches the diff via `gh` CLI, sends full file context from the locally checked-out branch
+- Requires the PR branch checked out locally and an agent-shell session open
+
+### Investigate workflow
+- `I` in the diagnostic buffer prompts for a question, then sends it to agent-shell with the diagnostic as context
+
+### Dismiss issues
+- `d` in the review buffer removes marked issues (or issue at point) from the list
+- Useful for triaging irrelevant findings without leaving the buffer
+
+### GitHub issue creation
+- `I` in the review buffer creates a GitHub issue from marked items (or issue at point) via `gh` CLI
+- Single issues get a detailed title with severity/file/line; multiple issues are grouped into one issue
+- URL is copied to the kill ring on success
+
+### Save / Load / Delete reviews
+- `s` in the review buffer saves the current review to disk (`.eld` files in `agent-review-save-directory`)
+- `M-x agent-review-load` restores a saved review with full navigation support
+- `M-x agent-review-delete-saved` removes a saved review from disk
+- Reviews persist across Emacs sessions; saved data includes project, agent, timestamp, and all issues
+
+### Commit range review (magit integration)
+- `M-x agent-review-commits` (or `C` in review buffer) reviews a range of already-committed changes
+- When called from a magit log buffer with a region, the commit range is derived automatically from the selected commits
+- Otherwise prompts for a range string (e.g. `HEAD~3..HEAD`)
+- Works without magit installed (falls back to manual input)
 
 ## Contributing
 
