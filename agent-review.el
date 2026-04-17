@@ -157,6 +157,45 @@ URL should be like https://github.com/owner/repo/pull/123."
             (match-string 2 url))
     (user-error "Invalid GitHub PR URL: %s" url)))
 
+;;; @mention completion
+
+(defvar agent-review--mention-cache (make-hash-table :test 'equal)
+  "Cache of GitHub usernames per repo (owner/name -> list of login strings).")
+
+(defun agent-review--fetch-repo-contributors (repo)
+  "Fetch contributor logins for REPO (e.g. \"owner/name\").
+Returns a list of username strings.  Results are cached per REPO."
+  (or (gethash repo agent-review--mention-cache)
+      (let ((logins
+             (with-temp-buffer
+               (when (zerop (call-process "gh" nil t nil
+                                          "api"
+                                          (format "/repos/%s/contributors" repo)
+                                          "--paginate"
+                                          "--jq" ".[].login"))
+                 (split-string (buffer-string) "\n" t)))))
+        (puthash repo logins agent-review--mention-cache)
+        logins)))
+
+(defun agent-review--mention-pr-url ()
+  "Return the PR URL for the current comment buffer, or nil."
+  (or (and (boundp 'agent-review--edit-pr-url) agent-review--edit-pr-url)
+      (and (boundp 'agent-review--edit-body-pr-url) agent-review--edit-body-pr-url)
+      (and (boundp 'agent-review--reply-pr-url) agent-review--reply-pr-url)
+      (and (boundp 'agent-review-pr-comments--pr-url) agent-review-pr-comments--pr-url)
+      (and (boundp 'agent-review--pr-url) agent-review--pr-url)))
+
+(defun agent-review-mention ()
+  "Insert an @mention by selecting a contributor from the repo."
+  (interactive)
+  (let* ((pr-url (agent-review--mention-pr-url))
+         (repo (and pr-url (car (agent-review--parse-pr-url pr-url))))
+         (contributors (and repo (agent-review--fetch-repo-contributors repo))))
+    (unless contributors
+      (user-error "No contributors found for %s" (or repo "unknown repo")))
+    (let ((login (completing-read "Mention: @" contributors nil t)))
+      (insert "@" login))))
+
 (defun agent-review--get-pr-diff (pr-url)
   "Fetch the diff for a GitHub PR at PR-URL using the gh CLI.
 Returns a changes alist with a :pr-diff key."
@@ -1338,6 +1377,7 @@ Returns the PR URL."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-c") #'agent-review-edit-comment-confirm)
     (define-key map (kbd "C-c C-k") #'agent-review-edit-comment-abort)
+    (define-key map (kbd "C-c m") #'agent-review-mention)
     map)
   "Keymap for `agent-review-edit-comment-mode'.")
 
@@ -1347,6 +1387,9 @@ Returns the PR URL."
 \\<agent-review-edit-comment-mode-map>\
 \\[agent-review-edit-comment-confirm] to confirm and advance to next issue.
 \\[agent-review-edit-comment-abort] to abort the entire review submission.")
+
+(evil-define-key* '(normal insert) agent-review-edit-comment-mode-map
+  (kbd "C-c m") #'agent-review-mention)
 
 (defun agent-review--edit-comment-header (issue index total)
   "Return a read-only header string for ISSUE at INDEX of TOTAL."
@@ -2313,6 +2356,7 @@ Returns the URL of the created comment."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-c") #'agent-review-reply-confirm)
     (define-key map (kbd "C-c C-k") #'agent-review-reply-abort)
+    (define-key map (kbd "C-c m") #'agent-review-mention)
     map)
   "Keymap for `agent-review-reply-mode'.")
 
@@ -2322,6 +2366,9 @@ Returns the URL of the created comment."
 \\<agent-review-reply-mode-map>\
 \\[agent-review-reply-confirm] to submit the reply.
 \\[agent-review-reply-abort] to abort.")
+
+(evil-define-key* '(normal insert) agent-review-reply-mode-map
+  (kbd "C-c m") #'agent-review-mention)
 
 (defun agent-review-reply-confirm ()
   "Submit the reply and close the edit buffer."
