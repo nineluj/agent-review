@@ -190,6 +190,17 @@ Returns alist with :staged and :unstaged keys."
             agent-review--session-id nil
             agent-review--session-response-text nil))))
 
+(defun agent-review--format-acp-error (err)
+  "Return a user-facing string describing ACP ERR.
+ERR is the alist passed to handlers registered via
+`acp-subscribe-to-errors' or to a request's `:on-failure' callback."
+  (let ((msg (or (map-elt err 'message)
+                 (map-elt err 'data))))
+    (cond
+     ((stringp msg) msg)
+     (msg (format "%S" msg))
+     (t (format "%S" err)))))
+
 (defun agent-review--request-review-async (changes config on-complete)
   "Send CHANGES to agent using CONFIG and call ON-COMPLETE when done.
 ON-COMPLETE is called with (response-text error) where error is nil on success."
@@ -220,16 +231,28 @@ ON-COMPLETE is called with (response-text error) where error is nil on success."
                        (setq agent-review--session-response-text
                              (concat agent-review--session-response-text .content.text)))))))))))
       
-      ;; Subscribe to errors
-      (acp-subscribe-to-errors
-       :client client
-       :buffer work-buffer
-       :on-error
-       (lambda (err)
-         (let ((response agent-review--session-response-text))
-           (agent-review--cleanup-session work-buffer)
-           (kill-buffer work-buffer)
-           (funcall on-complete nil (format "Agent error: %S" err)))))
+      ;; Subscribe to agent stderr notices.  Per `acp-subscribe-to-errors',
+      ;; these are agent process errors (anything written to the agent
+      ;; subprocess stderr), not authoritative request failures -- the
+      ;; latter are reported via the per-request `:on-failure' callbacks
+      ;; below.  Treat them as informational so a chatty stderr line (e.g.
+      ;; an MCP transport worker logging a non-fatal failure) does not abort
+      ;; an otherwise healthy review.  Mirrors `agent-shell' behavior.
+      ;;
+      ;; Capture WORK-BUFFER in the closure and drop notices once it has
+      ;; been killed: late stderr from a finished review must not clobber
+      ;; the status display of a subsequent review.
+      (let ((review-buffer work-buffer))
+        (acp-subscribe-to-errors
+         :client client
+         :buffer work-buffer
+         :on-error
+         (lambda (err)
+           (when (buffer-live-p review-buffer)
+             (let ((notice (agent-review--format-acp-error err)))
+               (agent-review--update-status-buffer
+                (format "Agent notice: %s" notice))
+               (message "agent-review notice: %s" notice))))))
       
       ;; Initialize (async)
       (agent-review--update-status-buffer "Handshaking with agent...")
@@ -282,17 +305,23 @@ ON-COMPLETE is called with (response-text error) where error is nil on success."
                    (lambda (err)
                      (agent-review--cleanup-session work-buffer)
                      (kill-buffer work-buffer)
-                     (funcall on-complete nil (format "Review request failed: %S" err)))))))
+                     (funcall on-complete nil
+                              (format "Review request failed: %s"
+                                      (agent-review--format-acp-error err))))))))
             :on-failure
             (lambda (err)
               (agent-review--cleanup-session work-buffer)
               (kill-buffer work-buffer)
-              (funcall on-complete nil (format "Session creation failed: %S" err))))))
+              (funcall on-complete nil
+                       (format "Session creation failed: %s"
+                               (agent-review--format-acp-error err)))))))
        :on-failure
        (lambda (err)
          (agent-review--cleanup-session work-buffer)
          (kill-buffer work-buffer)
-         (funcall on-complete nil (format "Initialization failed: %S" err)))))))
+         (funcall on-complete nil
+                  (format "Initialization failed: %s"
+                          (agent-review--format-acp-error err))))))))
 
 
 ;;; Response Parser
